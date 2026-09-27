@@ -12,7 +12,11 @@ use http::{
     HeaderMap, HeaderName,
 };
 
-use super::{io::WriteBuf, role::write_headers};
+use super::{
+    io::WriteBuf,
+    role::{write_headers, write_raw_headers},
+};
+use crate::ext::RawTrailers;
 
 type StaticBuf = &'static [u8];
 
@@ -21,6 +25,7 @@ type StaticBuf = &'static [u8];
 pub(crate) struct Encoder {
     kind: Kind,
     is_last: bool,
+    raw_trailers: Option<RawTrailers>,
 }
 
 #[derive(Debug)]
@@ -56,7 +61,14 @@ impl Encoder {
         Encoder {
             kind,
             is_last: false,
+            raw_trailers: None,
         }
+    }
+
+    /// Writes the trailers with the spelling and order `raw` records, once it does.
+    pub(crate) fn with_raw_trailers(mut self, raw: Option<RawTrailers>) -> Self {
+        self.raw_trailers = raw;
+        self
     }
 
     #[inline]
@@ -147,7 +159,10 @@ impl Encoder {
                 }
 
                 let mut buf = Vec::new();
-                write_headers(&allowed_trailers, &mut buf);
+                match self.raw_trailers.as_ref().and_then(|raw| raw.0.get()) {
+                    Some(raw) => write_raw_headers(&allowed_trailers, raw, &mut buf),
+                    None => write_headers(&allowed_trailers, &mut buf),
+                }
 
                 if buf.is_empty() {
                     return None;

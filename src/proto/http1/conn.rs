@@ -21,7 +21,7 @@ use super::{
 };
 use crate::{
     body::DecodedLength,
-    ext::OnInformational,
+    ext::{OnInformational, RawTrailers},
     proto::{headers, BodyLength, MessageHead},
     upgrade, Error, Result,
 };
@@ -163,7 +163,7 @@ where
         debug_assert!(self.can_read_head());
         trace!("Conn::read_head");
 
-        let msg = match self.io.parse::<T>(
+        let mut msg = match self.io.parse::<T>(
             cx,
             ParseContext {
                 cached_headers: &mut self.state.cached_headers,
@@ -202,6 +202,12 @@ where
             Wants::EMPTY
         };
 
+        let raw_trailers = (msg.decode == DecodedLength::CHUNKED).then(|| {
+            let raw = RawTrailers::default();
+            msg.head.extensions.insert(raw.clone());
+            raw
+        });
+
         if msg.decode == DecodedLength::ZERO {
             if msg.expect_continue {
                 debug!("ignoring expect-continue since body is empty");
@@ -211,20 +217,18 @@ where
         } else if msg.expect_continue && msg.head.version.gt(&Version::HTTP_10) {
             // TODO: remove this when we land h1_max_header_size support
             let h1_max_header_size = None;
-            self.state.reading = Reading::Continue(Decoder::new(
-                msg.decode,
-                self.state.h1_max_headers,
-                h1_max_header_size,
-            ));
+            self.state.reading = Reading::Continue(
+                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
+                    .with_raw_trailers(raw_trailers),
+            );
             wants = wants.add(Wants::EXPECT);
         } else {
             // TODO: remove this when we land h1_max_header_size support
             let h1_max_header_size = None;
-            self.state.reading = Reading::Body(Decoder::new(
-                msg.decode,
-                self.state.h1_max_headers,
-                h1_max_header_size,
-            ));
+            self.state.reading = Reading::Body(
+                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
+                    .with_raw_trailers(raw_trailers),
+            );
         }
 
         self.state.allow_trailer_fields = msg
@@ -522,6 +526,7 @@ where
         self.state.busy();
 
         self.enforce_version(&mut head);
+        let raw_trailers = head.extensions.get::<RawTrailers>().cloned();
         let buf = self.io.headers_buf();
 
         trace_span!("encode_headers");
@@ -540,7 +545,7 @@ where
                 self.state.cached_headers = Some(head.headers);
                 self.state.on_informational = head.extensions.remove::<OnInformational>();
 
-                Some(encoder)
+                Some(encoder.with_raw_trailers(raw_trailers))
             }
             Err(err) => {
                 self.state.error = Some(err);

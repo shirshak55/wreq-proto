@@ -167,3 +167,8 @@ version = "0.1"
 
 [dev-dependencies.tracing-subscriber]
 version = "0.3"
+
+[patch.crates-io]
+# http2 fork carrying `http2::ext::HeaderOrder`, which the HTTP/2 client records as
+# `RawHeaders` and sends requests in.
+http2 = { git = "https://github.com/shirshak55/http2", branch = "wiremason" }

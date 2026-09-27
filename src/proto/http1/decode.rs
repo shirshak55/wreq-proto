@@ -10,6 +10,7 @@ use http_body::Frame;
 
 use self::Kind::{Chunked, Eof, Length};
 use super::{io::MemRead, role::DEFAULT_MAX_HEADERS, DecodedLength};
+use crate::ext::RawTrailers;
 
 /// Maximum amount of bytes allowed in chunked extensions.
 ///
@@ -43,6 +44,7 @@ enum Kind {
         trailers_cnt: usize,
         h1_max_headers: Option<usize>,
         h1_max_header_size: Option<usize>,
+        raw_trailers: Option<RawTrailers>,
     },
     /// A Reader used for responses that don't indicate a length or chunked.
     ///
@@ -118,6 +120,7 @@ impl Decoder {
                 trailers_cnt: 0,
                 h1_max_headers,
                 h1_max_header_size,
+                raw_trailers: None,
             },
         }
     }
@@ -132,6 +135,14 @@ impl Decoder {
             DecodedLength::CLOSE_DELIMITED => Decoder::eof(),
             length => Decoder::length(length.danger_len()),
         }
+    }
+
+    /// Records a chunked body's trailer fields as sent into `raw` when it reads them.
+    pub(super) fn with_raw_trailers(mut self, raw: Option<RawTrailers>) -> Self {
+        if let Chunked { raw_trailers, .. } = &mut self.kind {
+            *raw_trailers = raw;
+        }
+        self
     }
 
     #[inline]
@@ -182,6 +193,7 @@ impl Decoder {
                 ref mut trailers_cnt,
                 ref h1_max_headers,
                 ref h1_max_header_size,
+                ref raw_trailers,
             } => {
                 let h1_max_headers = h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
                 let h1_max_header_size = h1_max_header_size.unwrap_or(TRAILER_LIMIT);
@@ -217,6 +229,7 @@ impl Decoder {
                             match decode_trailers(
                                 &mut trailers_buf.take().expect("Trailer is None"),
                                 *trailers_cnt,
+                                raw_trailers.as_ref(),
                             ) {
                                 Ok(headers) => {
                                     return Poll::Ready(Ok(Frame::trailers(headers)));
@@ -637,8 +650,13 @@ impl ChunkedState {
 }
 
 // TODO: disallow Transfer-Encoding, Content-Length, Trailer, etc in trailers ??
-fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Error> {
+fn decode_trailers(
+    buf: &mut BytesMut,
+    count: usize,
+    raw: Option<&RawTrailers>,
+) -> Result<HeaderMap, io::Error> {
     let mut trailers = HeaderMap::new();
+    let mut raw_fields = Vec::new();
     let mut headers = vec![httparse::EMPTY_HEADER; count];
     let res = httparse::parse_headers(buf, &mut headers);
     match res {
@@ -665,9 +683,18 @@ fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Er
                     }
                 };
 
-                trailers.insert(name, value);
+                if raw.is_some() {
+                    raw_fields.push((
+                        Bytes::copy_from_slice(header.name.as_bytes()),
+                        value.clone(),
+                    ));
+                }
+                trailers.append(name, value);
             }
 
+            if let Some(raw) = raw {
+                raw.0.get_or_init(|| raw_fields);
+            }
             Ok(trailers)
         }
         Ok(httparse::Status::Partial) => Err(io::Error::new(
@@ -1064,7 +1091,7 @@ mod tests {
         buf.extend_from_slice(
             b"Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\nX-Stream-Error: failed to decode\r\n\r\n",
         );
-        let headers = decode_trailers(&mut buf, 2).expect("decode_trailers");
+        let headers = decode_trailers(&mut buf, 2, None).expect("decode_trailers");
         assert_eq!(headers.len(), 2);
         assert_eq!(
             headers.get("Expires").unwrap(),

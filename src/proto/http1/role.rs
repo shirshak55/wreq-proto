@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::{self, Write as _},
     mem::MaybeUninit,
 };
@@ -636,6 +637,41 @@ pub(crate) fn write_headers(headers: &HeaderMap, dst: &mut Vec<u8>) {
         extend(dst, b": ");
         extend(dst, value.as_bytes());
         extend(dst, b"\r\n");
+    }
+}
+
+/// Writes `headers` in the order and spelling of the `raw` fields, each spelling taking
+/// the next value of its name, then the values `raw` doesn't cover, lowercase.
+pub(crate) fn write_raw_headers(
+    headers: &HeaderMap,
+    raw: &[(Bytes, HeaderValue)],
+    dst: &mut Vec<u8>,
+) {
+    let mut line = |name: &[u8], value: &HeaderValue| {
+        extend(dst, name);
+        extend(dst, b": ");
+        extend(dst, value.as_bytes());
+        extend(dst, b"\r\n");
+    };
+    let mut values = HashMap::new();
+    for (spelling, _) in raw {
+        let Ok(name) = HeaderName::from_bytes(spelling) else {
+            continue;
+        };
+        let values = values
+            .entry(name)
+            .or_insert_with_key(|name| headers.get_all(name).iter());
+        if let Some(value) = values.next() {
+            line(spelling, value);
+        }
+    }
+    for name in headers.keys() {
+        let rest = values
+            .remove(name)
+            .unwrap_or_else(|| headers.get_all(name).iter());
+        for value in rest {
+            line(name.as_ref(), value);
+        }
     }
 }
 

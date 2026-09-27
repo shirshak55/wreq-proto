@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     future::Future,
     marker::PhantomData,
@@ -16,9 +17,10 @@ use futures_util::{
     future::{Either, FusedFuture},
     stream::{FusedStream, Stream},
 };
-use http::{Method, Request, Response, StatusCode};
+use http::{HeaderName, Method, Request, Response, StatusCode};
 use http2::{
     client::{Builder, Connection, ResponseFuture, SendRequest},
+    ext::HeaderOrder,
     SendStream,
 };
 use http_body::Body;
@@ -34,7 +36,7 @@ use crate::{
     body::{self, Incoming},
     dispatch::{self, Callback, SendWhen, TrySendError},
     error::BoxError,
-    ext::{OnInformational, OnPreserveHeader},
+    ext::{OnInformational, OnPreserveHeader, RawHeaders},
     proto::{headers, Dispatched},
     rt::{bounds::Http2ClientConnExec, Time},
     upgrade::{self, Upgraded},
@@ -513,9 +515,10 @@ where
         // Interim (1xx) responses reach the request's callback, in order, before the
         // final response is taken.
         if let Some(callback) = this.on_informational.as_ref() {
-            while let Poll::Ready(Some(Ok(res))) =
+            while let Poll::Ready(Some(Ok(mut res))) =
                 this.fut.as_mut().get_mut().poll_informational(cx)
             {
+                record_raw_headers(&mut res);
                 callback.call(res);
             }
         }
@@ -526,9 +529,10 @@ where
         let send_stream = this.send_stream.take().expect("Future polled twice");
 
         match result {
-            Ok(res) => {
+            Ok(mut res) => {
                 // record that we got the response headers
                 ping.record_non_data();
+                record_raw_headers(&mut res);
 
                 let content_length = headers::content_length_parse_all(res.headers());
                 if let (Some(mut send_stream), StatusCode::OK) = (send_stream, res.status()) {
@@ -573,6 +577,29 @@ where
             }
         }
     }
+}
+
+/// Records a response head's field order as [`RawHeaders`], as the HTTP/1 parser does,
+/// so repeats interleaved with other fields keep their place.
+fn record_raw_headers<T>(res: &mut Response<T>) {
+    let Some(HeaderOrder(order)) = res.extensions_mut().remove::<HeaderOrder>() else {
+        return;
+    };
+    let raw = {
+        let mut values = HashMap::new();
+        order
+            .into_iter()
+            .filter_map(|name| {
+                let value = values
+                    .entry(name.clone())
+                    .or_insert_with(|| res.headers().get_all(&name).iter())
+                    .next()?
+                    .clone();
+                Some((Bytes::copy_from_slice(name.as_ref()), value))
+            })
+            .collect()
+    };
+    res.extensions_mut().insert(RawHeaders(raw));
 }
 
 impl<B, E, T> Future for ClientTask<B, E, T>
@@ -627,6 +654,13 @@ where
                     // Sort headers
                     if let Some(header_sort) = req.extensions_mut().remove::<OnPreserveHeader>() {
                         header_sort.call(req.headers_mut());
+                        // `call` groups a repeated name's values: send the fields in the
+                        // order the callback writes them, repeats interleaved in place.
+                        let mut order = Vec::with_capacity(req.headers().len());
+                        header_sort.call_visit(&mut req.headers().clone(), &mut |name, _| {
+                            order.extend(HeaderName::from_bytes(name.as_ref()).ok());
+                        });
+                        req.extensions_mut().insert(HeaderOrder(order));
                     }
 
                     let is_connect = req.method() == Method::CONNECT;
