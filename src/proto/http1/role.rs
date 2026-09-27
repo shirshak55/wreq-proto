@@ -14,7 +14,7 @@ use super::{Encode, Encoder, Http1Transaction, ParseContext, ParsedMessage};
 use crate::{
     body::DecodedLength,
     error::Parse,
-    ext::{OnPreserveHeader, ReasonPhrase},
+    ext::{OnPreserveHeader, RawHeaders, ReasonPhrase},
     proto::{headers, BodyLength, MessageHead, RequestHead, RequestLine},
     Error, Result,
 };
@@ -194,6 +194,7 @@ impl Http1Transaction for Client {
             let mut headers = ctx.cached_headers.take().unwrap_or_default();
 
             let mut keep_alive = version == Version::HTTP_11;
+            let mut raw_headers = Vec::with_capacity(headers_len);
 
             headers.reserve(headers_len);
             for header in &headers_indices[..headers_len] {
@@ -214,10 +215,12 @@ impl Http1Transaction for Client {
                     }
                 }
 
+                raw_headers.push((slice.slice(header.name.0..header.name.1), value.clone()));
                 headers.append(name, value);
             }
 
             let mut extensions = http::Extensions::default();
+            extensions.insert(RawHeaders(raw_headers));
 
             if let Some(reason) = reason {
                 // Safety: httparse ensures that only valid reason phrase bytes are present in this
@@ -480,26 +483,6 @@ impl Client {
             }
         };
 
-        let encoder = encoder.map(|enc| {
-            if enc.is_chunked() {
-                // Parse Trailer header values into HeaderNames.
-                // Each Trailer header value may contain comma-separated names.
-                // HeaderName normalizes to lowercase, enabling case-insensitive matching.
-                let allowed_trailer_fields: Vec<HeaderName> = headers
-                    .get_all(header::TRAILER)
-                    .iter()
-                    .filter_map(|hv| hv.to_str().ok())
-                    .flat_map(|s| s.split(','))
-                    .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
-                    .collect();
-
-                if !allowed_trailer_fields.is_empty() {
-                    return enc.into_chunked_with_trailing_fields(allowed_trailer_fields);
-                }
-            }
-
-            enc
-        });
 
         // This is because we need a second mutable borrow to remove
         // content-length header.

@@ -83,4 +83,11 @@ impl Response<'_> {
     pub fn headers(&self) -> &http::HeaderMap {
         self.0.headers()
     }
+
+    /// The head's extensions, such as its [`RawHeaders`](crate::ext::RawHeaders) and
+    /// non-canonical [`ReasonPhrase`](crate::ext::ReasonPhrase).
+    #[inline]
+    pub fn extensions(&self) -> &http::Extensions {
+        self.0.extensions()
+    }
 }
