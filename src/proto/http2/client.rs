@@ -34,7 +34,7 @@ use crate::{
     body::{self, Incoming},
     dispatch::{self, Callback, SendWhen, TrySendError},
     error::BoxError,
-    ext::OnPreserveHeader,
+    ext::{OnInformational, OnPreserveHeader},
     proto::{headers, Dispatched},
     rt::{bounds::Http2ClientConnExec, Time},
     upgrade::{self, Upgraded},
@@ -314,6 +314,7 @@ where
     body_tx: SendStream<SendBuf<B::Data>>,
     body: B,
     cb: Callback<Request<B>, Response<Incoming>>,
+    on_informational: Option<OnInformational>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -449,6 +450,7 @@ where
                     ping: Some(ping),
                     send_stream: Some(send_stream),
                     cancel_tx: Some(cancel_tx),
+                    on_informational: f.on_informational,
                 },
                 call_back: Some(f.cb),
             },
@@ -485,6 +487,7 @@ pin_project! {
         #[pin]
         send_stream: Option<Option<SendStream<SendBuf<<B as Body>::Data>>>>,
         cancel_tx: Option<oneshot::Sender<()>>,
+        on_informational: Option<OnInformational>,
     }
 }
 
@@ -506,6 +509,16 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
+
+        // Interim (1xx) responses reach the request's callback, in order, before the
+        // final response is taken.
+        if let Some(callback) = this.on_informational.as_ref() {
+            while let Poll::Ready(Some(Ok(res))) =
+                this.fut.as_mut().get_mut().poll_informational(cx)
+            {
+                callback.call(res);
+            }
+        }
 
         let result = ready!(this.fut.poll(cx));
 
@@ -603,6 +616,7 @@ where
                     }
                     let (head, body) = req.into_parts();
                     let mut req = ::http::Request::from_parts(head, ());
+                    let on_informational = req.extensions_mut().remove::<OnInformational>();
                     super::strip_connection_headers(req.headers_mut(), true);
                     if let Some(len) = body.size_hint().exact() {
                         if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
@@ -649,6 +663,7 @@ where
                         body_tx,
                         body,
                         cb,
+                        on_informational,
                     };
 
                     // Check poll_ready() again.
