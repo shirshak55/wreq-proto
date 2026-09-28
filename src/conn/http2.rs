@@ -297,6 +297,12 @@ where
         if let Some(params) = self.opts.settings_frame {
             builder.settings_frame(params);
         }
+        if let Some(frames) = self.opts.unknown_frames {
+            builder.unknown_frames(frames);
+        }
+        if let Some(limit) = self.opts.record_frames {
+            builder.record_frames(limit);
+        }
 
         // Create the ping configuration for the connection.
         let ping_config = ping::Config::new(

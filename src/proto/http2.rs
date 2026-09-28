@@ -17,7 +17,10 @@ use http::{
     header::{HeaderName, CONNECTION, TE, TRANSFER_ENCODING, UPGRADE},
     HeaderMap, HeaderValue,
 };
-pub use http2::ext::HeadersFrameOptions;
+pub use http2::ext::{
+    FollowingFrame, FrameLog, HeadersFrame, HeadersFrameOptions, LoggedFrame, PseudoHeader,
+    StreamPriority, UnknownFrame,
+};
 pub use http2::frame::{
     Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
     SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
@@ -588,6 +591,12 @@ pub struct Http2Options {
     /// The exact parameters of the initial SETTINGS frame, in place of the individual
     /// settings and their order.
     pub settings_frame: Option<Vec<(u16, u32)>>,
+
+    /// Frames of types HTTP/2 doesn't define, sent once ahead of the first request.
+    pub unknown_frames: Option<Vec<UnknownFrame>>,
+
+    /// How many of the frames it sends a connection records, if it records them.
+    pub record_frames: Option<usize>,
 }
 
 impl Http2OptionsBuilder {
@@ -923,6 +932,26 @@ impl Http2OptionsBuilder {
         self
     }
 
+    /// Sends `frames`, of types HTTP/2 doesn't define (GREASE and the like), once, right
+    /// ahead of the connection's first request's HEADERS, after its PRIORITY frames.
+    #[inline]
+    pub fn unknown_frames<I>(mut self, frames: I) -> Self
+    where
+        I: IntoIterator<Item = UnknownFrame>,
+    {
+        self.opts.unknown_frames = Some(frames.into_iter().collect());
+        self
+    }
+
+    /// Records up to `limit` of the frames each connection sends but DATA, in wire order:
+    /// each response then carries a [`HeadersFrame`] with its request's HEADERS as sent
+    /// and the connection's [`FrameLog`].
+    #[inline]
+    pub fn record_frames(mut self, limit: usize) -> Self {
+        self.opts.record_frames = Some(limit);
+        self
+    }
+
     /// Builds the `Http2Options` instance.
     #[inline]
     pub fn build(self) -> Http2Options {
@@ -974,6 +1003,8 @@ impl Default for Http2Options {
             priorities: None,
             priorities_once: false,
             settings_frame: None,
+            unknown_frames: None,
+            record_frames: None,
         }
     }
 }

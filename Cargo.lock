@@ -162,7 +162,7 @@ dependencies = [
 [[package]]
 name = "http2"
 version = "0.5.20"
-source = "git+https://github.com/shirshak55/http2?branch=wiremason#96b00b8c0e242fd2c00dd8568155f02b022498d4"
+source = "git+https://github.com/shirshak55/http2?branch=wiremason#4e803a32caa545091b2f58c9c036eb3092932329"
 dependencies = [
  "atomic-waker",
  "bytes",
