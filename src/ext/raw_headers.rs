@@ -16,13 +16,13 @@ impl RawHeaders {
     }
 }
 
-/// An HTTP/1 chunked message's trailer fields in wire order, each name spelled as sent,
-/// which the trailers `HeaderMap` its body yields lowercases and groups.
+/// A message's trailer fields in wire order, each name spelled as sent (lowercase over
+/// HTTP/2), which the trailers `HeaderMap` its body yields lowercases and groups.
 ///
-/// A received chunked response carries one, filled as its trailers are read, before the
-/// body yields them. A request sent carrying a filled one writes its trailers in that
-/// spelling and order. Clones share the fields, so a proxy can hand a received message's
-/// record (or its cell, from another HTTP library) to the request it relays before the
-/// trailers arrive.
+/// A received HTTP/1 chunked or HTTP/2 response carries one, filled as its trailers are
+/// read, before the body yields them. A request sent carrying a filled one writes its
+/// trailers in that spelling and order. Clones share the fields, so a proxy can hand a
+/// received message's record (or its cell, from another HTTP library) to the request it
+/// relays before the trailers arrive.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RawTrailers(pub Arc<OnceLock<Vec<(Bytes, HeaderValue)>>>);

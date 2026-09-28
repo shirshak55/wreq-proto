@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     convert::Infallible,
     future::Future,
     marker::PhantomData,
@@ -28,7 +27,7 @@ use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{
-    ping,
+    ordered_fields, ping,
     ping::{Ponger, Recorder},
     H2Upgraded, PipeToSendStream, SendBuf,
 };
@@ -36,7 +35,7 @@ use crate::{
     body::{self, Incoming},
     dispatch::{self, Callback, SendWhen, TrySendError},
     error::BoxError,
-    ext::{OnInformational, OnPreserveHeader, RawHeaders},
+    ext::{OnInformational, OnPreserveHeader, RawHeaders, RawTrailers},
     proto::{headers, Dispatched},
     rt::{bounds::Http2ClientConnExec, Time},
     upgrade::{self, Upgraded},
@@ -317,6 +316,7 @@ where
     body: B,
     cb: Callback<Request<B>, Response<Incoming>>,
     on_informational: Option<OnInformational>,
+    raw_trailers: Option<RawTrailers>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -414,7 +414,7 @@ where
 
         let send_stream = if !f.is_connect {
             if !f.eos {
-                let mut pipe = PipeToSendStream::new(f.body, f.body_tx);
+                let mut pipe = PipeToSendStream::new(f.body, f.body_tx, f.raw_trailers);
 
                 // eagerly see if the body pipe is ready and
                 // can thus skip allocating in the executor
@@ -562,10 +562,13 @@ where
 
                     Poll::Ready(Ok(res))
                 } else {
-                    let res = res.map(|stream| {
+                    // Trailers may follow the body; record their field order.
+                    let raw_trailers = RawTrailers::default();
+                    let mut res = res.map(|stream| {
                         let ping = ping.for_stream(&stream);
-                        Incoming::h2(stream, content_length.into(), ping)
+                        Incoming::h2(stream, content_length.into(), ping, raw_trailers.clone())
                     });
+                    res.extensions_mut().insert(raw_trailers);
                     Poll::Ready(Ok(res))
                 }
             }
@@ -585,20 +588,7 @@ fn record_raw_headers<T>(res: &mut Response<T>) {
     let Some(HeaderOrder(order)) = res.extensions_mut().remove::<HeaderOrder>() else {
         return;
     };
-    let raw = {
-        let mut values = HashMap::new();
-        order
-            .into_iter()
-            .filter_map(|name| {
-                let value = values
-                    .entry(name.clone())
-                    .or_insert_with(|| res.headers().get_all(&name).iter())
-                    .next()?
-                    .clone();
-                Some((Bytes::copy_from_slice(name.as_ref()), value))
-            })
-            .collect()
-    };
+    let raw = ordered_fields(res.headers(), order);
     res.extensions_mut().insert(RawHeaders(raw));
 }
 
@@ -678,6 +668,8 @@ where
                         continue;
                     }
 
+                    // `send_request` clears the extensions.
+                    let raw_trailers = req.extensions().get::<RawTrailers>().cloned();
                     let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
                         Ok(ok) => ok,
                         Err(err) => {
@@ -698,6 +690,7 @@ where
                         body,
                         cb,
                         on_informational,
+                        raw_trailers,
                     };
 
                     // Check poll_ready() again.

@@ -4,6 +4,7 @@ pub(crate) mod client;
 pub(crate) mod ping;
 
 use std::{
+    collections::HashMap,
     future::Future,
     io::{self, Cursor, IoSlice},
     pin::Pin,
@@ -14,18 +15,18 @@ use std::{
 use bytes::{Buf, Bytes};
 use http::{
     header::{HeaderName, CONNECTION, TE, TRANSFER_ENCODING, UPGRADE},
-    HeaderMap,
+    HeaderMap, HeaderValue,
 };
 pub use http2::frame::{
     Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
     SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
 };
-use http2::{Reason, RecvStream, SendStream};
+use http2::{ext::HeaderOrder, Reason, RecvStream, SendStream};
 use http_body::Body;
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{error::BoxError, Error, Result};
+use crate::{error::BoxError, ext::RawTrailers, Error, Result};
 
 /// Default initial stream window size defined in HTTP2 spec.
 const SPEC_WINDOW_SIZE: u32 = 65_535;
@@ -119,6 +120,8 @@ pin_project! {
         // it survives across `Poll::Pending` returns from `poll_capacity`; if
         // we left the chunk in a local, it would be dropped on every repoll.
         buffered_data: Option<Peeked<S::Data>>,
+        // The trailer field order to send the body's trailers in, once recorded.
+        raw_trailers: Option<RawTrailers>,
     }
 }
 
@@ -127,12 +130,17 @@ where
     S: Body,
 {
     #[inline]
-    fn new(stream: S, body_tx: SendStream<SendBuf<S::Data>>) -> PipeToSendStream<S> {
+    fn new(
+        stream: S,
+        body_tx: SendStream<SendBuf<S::Data>>,
+        raw_trailers: Option<RawTrailers>,
+    ) -> PipeToSendStream<S> {
         PipeToSendStream {
             stream,
             body_tx,
             data_done: false,
             buffered_data: None,
+            raw_trailers,
         }
     }
 
@@ -242,7 +250,10 @@ where
                         // no more DATA, so give any capacity back
                         me.body_tx.reserve_capacity(0);
                         me.body_tx
-                            .send_trailers(frame.into_trailers().unwrap_or_else(|_| unreachable!()))
+                            .send_trailers_with_order(
+                                frame.into_trailers().unwrap_or_else(|_| unreachable!()),
+                                trailer_order(me.raw_trailers.as_ref()),
+                            )
                             .map_err(Error::new_body_write)?;
                         return Poll::Ready(Ok(()));
                     } else {
@@ -448,6 +459,36 @@ where
             },
         )))
     }
+}
+
+/// `fields` in `order`, each name as bytes, each listed name taking the next value of
+/// that name.
+pub(crate) fn ordered_fields(
+    fields: &HeaderMap,
+    order: Vec<HeaderName>,
+) -> Vec<(Bytes, HeaderValue)> {
+    let mut values = HashMap::new();
+    order
+        .into_iter()
+        .filter_map(|name| {
+            let value = values
+                .entry(name.clone())
+                .or_insert_with(|| fields.get_all(&name).iter())
+                .next()?
+                .clone();
+            Some((Bytes::copy_from_slice(name.as_ref()), value))
+        })
+        .collect()
+}
+
+/// The field order `raw` recorded, once it has, to send trailers in.
+fn trailer_order(raw: Option<&RawTrailers>) -> HeaderOrder {
+    let fields = raw.and_then(|raw| raw.0.get()).into_iter().flatten();
+    HeaderOrder(
+        fields
+            .filter_map(|(name, _)| HeaderName::from_bytes(name).ok())
+            .collect(),
+    )
 }
 
 fn h2_to_io_error(e: http2::Error) -> std::io::Error {

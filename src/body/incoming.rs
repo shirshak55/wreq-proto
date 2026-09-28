@@ -9,10 +9,15 @@ use bytes::Bytes;
 use futures_channel::{mpsc, oneshot};
 use futures_util::{stream::FusedStream, Stream};
 use http::HeaderMap;
+use http2::ext::HeaderOrder;
 use http_body::{Body, Frame, SizeHint};
 
 use super::{watch, DecodedLength};
-use crate::{proto::http2::ping, Error, Result};
+use crate::{
+    ext::RawTrailers,
+    proto::http2::{ordered_fields, ping},
+    Error, Result,
+};
 
 /// A stream of [`Bytes`], used when receiving bodies from the network.
 ///
@@ -35,6 +40,7 @@ enum Kind {
         recv: http2::RecvStream,
         content_length: DecodedLength,
         data_done: bool,
+        raw_trailers: RawTrailers,
     },
     Empty,
 }
@@ -95,6 +101,7 @@ impl Incoming {
         recv: http2::RecvStream,
         mut content_length: DecodedLength,
         ping: ping::Recorder,
+        raw_trailers: RawTrailers,
     ) -> Self {
         // If the stream is already EOS, then the "unknown length" is clearly
         // actually ZERO.
@@ -108,6 +115,7 @@ impl Incoming {
                 recv,
                 content_length,
                 data_done: false,
+                raw_trailers,
             },
         }
     }
@@ -148,6 +156,7 @@ impl Body for Incoming {
                 ref mut recv,
                 ref mut content_length,
                 ref mut data_done,
+                ref raw_trailers,
             } => {
                 if !*data_done {
                     match ready!(recv.poll_data(cx)) {
@@ -175,10 +184,16 @@ impl Body for Incoming {
                 }
 
                 // after data, check trailers
-                match ready!(recv.poll_trailers(cx)) {
+                match ready!(recv.poll_trailers_with_order(cx)) {
                     Ok(t) => {
                         ping.record_non_data();
-                        Poll::Ready(Ok(t.map(Frame::trailers)).transpose())
+                        let t = t.map(|(trailers, HeaderOrder(order))| {
+                            raw_trailers
+                                .0
+                                .get_or_init(|| ordered_fields(&trailers, order));
+                            Frame::trailers(trailers)
+                        });
+                        Poll::Ready(Ok(t).transpose())
                     }
                     Err(e) => {
                         if let Some(http2::Reason::NO_ERROR) = e.reason() {
@@ -307,7 +322,7 @@ mod tests {
         // the size by too much.
 
         let body_size = mem::size_of::<Incoming>();
-        let body_expected_size = mem::size_of::<u64>() * 5;
+        let body_expected_size = mem::size_of::<u64>() * 6;
         assert!(
             body_size <= body_expected_size,
             "Body size = {body_size} <= {body_expected_size}",
