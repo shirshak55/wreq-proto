@@ -179,6 +179,7 @@ where
                     h1_max_headers: parse_ctx.h1_max_headers,
                     h09_responses: parse_ctx.h09_responses,
                     on_informational: parse_ctx.on_informational,
+                    expect_continue: parse_ctx.expect_continue,
                 },
             )? {
                 Some(msg) => {
@@ -657,6 +658,7 @@ mod tests {
                 h1_max_headers: None,
                 h09_responses: false,
                 on_informational: &mut None,
+                expect_continue: &mut None,
             };
             assert!(buffered
                 .parse::<http1::role::Client>(cx, parse_ctx)

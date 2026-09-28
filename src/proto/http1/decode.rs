@@ -10,7 +10,7 @@ use http_body::Frame;
 
 use self::Kind::{Chunked, Eof, Length};
 use super::{io::MemRead, role::DEFAULT_MAX_HEADERS, DecodedLength};
-use crate::ext::RawTrailers;
+use crate::ext::{RawChunks, RawTrailers};
 
 /// Maximum amount of bytes allowed in chunked extensions.
 ///
@@ -45,6 +45,9 @@ enum Kind {
         h1_max_headers: Option<usize>,
         h1_max_header_size: Option<usize>,
         raw_trailers: Option<RawTrailers>,
+        raw_chunks: Option<RawChunks>,
+        /// The chunk-size line being read, for `raw_chunks`.
+        raw_line: BytesMut,
     },
     /// A Reader used for responses that don't indicate a length or chunked.
     ///
@@ -80,6 +83,26 @@ enum ChunkedState {
     EndCr,
     EndLf,
     End,
+}
+
+/// Reads through `rdr`, appending what it reads to `line`.
+struct LineRecorder<'a, R> {
+    rdr: &'a mut R,
+    line: &'a mut BytesMut,
+}
+
+impl<R: MemRead> MemRead for LineRecorder<'_, R> {
+    fn read_mem(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<Bytes>> {
+        let buf = ready!(self.rdr.read_mem(cx, len))?;
+        if self.line.len() + buf.len() > CHUNKED_EXTENSIONS_LIMIT as usize {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk size line over limit",
+            )));
+        }
+        self.line.extend_from_slice(&buf);
+        Poll::Ready(Ok(buf))
+    }
 }
 
 struct StepArgs<'a> {
@@ -121,6 +144,8 @@ impl Decoder {
                 h1_max_headers,
                 h1_max_header_size,
                 raw_trailers: None,
+                raw_chunks: None,
+                raw_line: BytesMut::new(),
             },
         }
     }
@@ -141,6 +166,14 @@ impl Decoder {
     pub(super) fn with_raw_trailers(mut self, raw: Option<RawTrailers>) -> Self {
         if let Chunked { raw_trailers, .. } = &mut self.kind {
             *raw_trailers = raw;
+        }
+        self
+    }
+
+    /// Records a chunked body's chunk-size lines as sent into `raw` as it reads them.
+    pub(super) fn with_raw_chunks(mut self, raw: Option<RawChunks>) -> Self {
+        if let Chunked { raw_chunks, .. } = &mut self.kind {
+            *raw_chunks = raw;
         }
         self
     }
@@ -194,25 +227,40 @@ impl Decoder {
                 ref h1_max_headers,
                 ref h1_max_header_size,
                 ref raw_trailers,
+                ref raw_chunks,
+                ref mut raw_line,
             } => {
                 let h1_max_headers = h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
                 let h1_max_header_size = h1_max_header_size.unwrap_or(TRAILER_LIMIT);
                 loop {
                     let mut buf = None;
+                    let args = StepArgs {
+                        chunk_size: chunk_len,
+                        extensions_cnt,
+                        chunk_buf: &mut buf,
+                        trailers_buf,
+                        trailers_cnt,
+                        max_headers_cnt: h1_max_headers,
+                        max_headers_bytes: h1_max_header_size,
+                    };
+                    let prev = *state;
                     // advances the chunked state
-                    *state = ready!(state.step(
-                        cx,
-                        body,
-                        StepArgs {
-                            chunk_size: chunk_len,
-                            extensions_cnt,
-                            chunk_buf: &mut buf,
-                            trailers_buf,
-                            trailers_cnt,
-                            max_headers_cnt: h1_max_headers,
-                            max_headers_bytes: h1_max_header_size,
+                    *state = if raw_chunks.is_some() && state.is_size_line() {
+                        let mut rdr = LineRecorder {
+                            rdr: body,
+                            line: raw_line,
+                        };
+                        ready!(state.step(cx, &mut rdr, args))?
+                    } else {
+                        ready!(state.step(cx, body, args))?
+                    };
+                    if prev == ChunkedState::SizeLf {
+                        if let Some(raw) = raw_chunks {
+                            // The line ends at its CR, which the recorder read too.
+                            raw_line.truncate(raw_line.len().saturating_sub(1));
+                            raw.lock().push((*chunk_len, raw_line.split().freeze()));
                         }
-                    ))?;
+                    }
                     if *state == ChunkedState::End {
                         trace!("end of chunked");
 
@@ -317,6 +365,17 @@ macro_rules! put_u8 {
 impl ChunkedState {
     fn new() -> ChunkedState {
         ChunkedState::Start
+    }
+
+    /// Whether this state reads a chunk-size line, up to and including its CR.
+    fn is_size_line(self) -> bool {
+        matches!(
+            self,
+            ChunkedState::Start
+                | ChunkedState::Size
+                | ChunkedState::SizeLws
+                | ChunkedState::Extension
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

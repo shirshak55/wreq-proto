@@ -250,6 +250,10 @@ impl Http1Transaction for Client {
             }
 
             if head.subject.is_informational() {
+                if head.subject == StatusCode::CONTINUE {
+                    // The server wants the body a request with `Expect: 100-continue` holds back.
+                    *ctx.expect_continue = None;
+                }
                 if let Some(callback) = ctx.on_informational {
                     callback.call(head.into_response(()));
                 }

@@ -1,4 +1,4 @@
-use std::{fmt, io::IoSlice};
+use std::{collections::VecDeque, fmt, io::IoSlice};
 
 use bytes::{
     buf::{Chain, Take},
@@ -16,7 +16,7 @@ use super::{
     io::WriteBuf,
     role::{write_headers, write_raw_headers},
 };
-use crate::ext::RawTrailers;
+use crate::ext::{RawChunks, RawTrailers};
 
 type StaticBuf = &'static [u8];
 
@@ -26,6 +26,17 @@ pub(crate) struct Encoder {
     kind: Kind,
     is_last: bool,
     raw_trailers: Option<RawTrailers>,
+    raw_chunks: Option<ChunkPlan>,
+}
+
+/// Where a chunked body being written stands in the [`RawChunks`] it follows.
+#[derive(Debug, Clone, PartialEq)]
+struct ChunkPlan {
+    record: RawChunks,
+    /// The index of the next recorded line to write.
+    next: usize,
+    /// The bytes still owed to the chunk being written.
+    remaining: u64,
 }
 
 #[derive(Debug)]
@@ -52,8 +63,13 @@ enum BufKind<B> {
     Limited(Take<B>),
     Chunked(Chain<Chain<ChunkSize, B>, StaticBuf>),
     ChunkedEnd(StaticBuf),
-    Trailers(Chain<Chain<StaticBuf, Bytes>, StaticBuf>),
+    Trailers(Chain<Chain<Bytes, Bytes>, StaticBuf>),
+    Segments(Segments),
 }
+
+/// Byte runs written in order: body data split and framed at recorded chunk sizes.
+#[derive(Debug, Default)]
+struct Segments(VecDeque<Bytes>);
 
 impl Encoder {
     #[inline]
@@ -62,6 +78,7 @@ impl Encoder {
             kind,
             is_last: false,
             raw_trailers: None,
+            raw_chunks: None,
         }
     }
 
@@ -69,6 +86,50 @@ impl Encoder {
     pub(crate) fn with_raw_trailers(mut self, raw: Option<RawTrailers>) -> Self {
         self.raw_trailers = raw;
         self
+    }
+
+    /// Writes a chunked body at the chunk sizes and with the chunk-size lines `raw` records.
+    pub(crate) fn with_raw_chunks(mut self, raw: Option<RawChunks>) -> Self {
+        self.raw_chunks = raw
+            .filter(|_| self.kind == Kind::Chunked)
+            .map(|record| ChunkPlan {
+                record,
+                next: 0,
+                remaining: 0,
+            });
+        self
+    }
+
+    /// Whether a chunked body is written at recorded chunk sizes.
+    pub(crate) fn has_raw_chunks(&self) -> bool {
+        self.raw_chunks.is_some()
+    }
+
+    /// Fails when the body ended inside a recorded chunk, whose size line is already out.
+    pub(crate) fn check_raw_chunks_complete(&self) -> Result<(), NotEof> {
+        match &self.raw_chunks {
+            Some(plan) if plan.remaining > 0 => Err(NotEof(plan.remaining)),
+            _ => Ok(()),
+        }
+    }
+
+    /// The last-chunk line, as recorded when a chunked body follows a record.
+    fn last_chunk(&self) -> Bytes {
+        self.raw_chunks
+            .as_ref()
+            .and_then(|plan| {
+                plan.record
+                    .lock()
+                    .get(plan.next)
+                    .filter(|(size, _)| *size == 0)
+                    .map(|(_, line)| {
+                        let mut last = Vec::with_capacity(line.len() + 2);
+                        last.extend_from_slice(line);
+                        last.extend_from_slice(b"\r\n");
+                        Bytes::from(last)
+                    })
+            })
+            .unwrap_or_else(|| Bytes::from_static(b"0\r\n"))
     }
 
     #[inline]
@@ -99,6 +160,13 @@ impl Encoder {
     pub(crate) fn end<B>(&self) -> Result<Option<EncodedBuf<B>>, NotEof> {
         match self.kind {
             Kind::Length(0) => Ok(None),
+            Kind::Chunked if self.raw_chunks.is_some() => {
+                self.check_raw_chunks_complete()?;
+                let end = [self.last_chunk(), Bytes::from_static(b"\r\n")];
+                Ok(Some(EncodedBuf {
+                    kind: BufKind::Segments(Segments(end.into())),
+                }))
+            }
             Kind::Chunked => Ok(Some(EncodedBuf {
                 kind: BufKind::ChunkedEnd(b"0\r\n\r\n"),
             })),
@@ -114,6 +182,11 @@ impl Encoder {
         debug_assert!(len > 0, "encode() called with empty buf");
 
         let kind = match self.kind {
+            Kind::Chunked if self.raw_chunks.is_some() => {
+                trace!("encoding chunked {}B at recorded chunk sizes", len);
+                let plan = self.raw_chunks.as_mut().expect("raw chunks");
+                BufKind::Segments(plan.encode(msg))
+            }
             Kind::Chunked => {
                 trace!("encoding chunked {}B", len);
                 let buf = ChunkSize::new(len)
@@ -169,7 +242,9 @@ impl Encoder {
                 }
 
                 Some(EncodedBuf {
-                    kind: BufKind::Trailers(b"0\r\n".chain(Bytes::from(buf)).chain(b"\r\n")),
+                    kind: BufKind::Trailers(
+                        self.last_chunk().chain(Bytes::from(buf)).chain(b"\r\n"),
+                    ),
                 })
             }
             _ => {
@@ -218,6 +293,78 @@ impl Encoder {
     }
 }
 
+impl ChunkPlan {
+    /// Frames `msg` as the rest of the chunk being written and the recorded chunks after
+    /// it; bytes past the record go out as one chunk.
+    fn encode<B: Buf>(&mut self, mut msg: B) -> Segments {
+        const CRLF: Bytes = Bytes::from_static(b"\r\n");
+        let lines = self.record.lock();
+        let mut out = Segments::default();
+        while msg.has_remaining() {
+            if self.remaining == 0 {
+                match lines.get(self.next) {
+                    Some((size, line)) if *size > 0 => {
+                        out.0.push_back(line.clone());
+                        out.0.push_back(CRLF);
+                        self.remaining = *size;
+                        self.next += 1;
+                    }
+                    _ => {
+                        let len = msg.remaining();
+                        out.0.push_back(Bytes::from(format!("{len:X}\r\n")));
+                        out.0.push_back(msg.copy_to_bytes(len));
+                        out.0.push_back(CRLF);
+                        break;
+                    }
+                }
+            }
+            let len = msg
+                .remaining()
+                .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+            out.0.push_back(msg.copy_to_bytes(len));
+            self.remaining -= len as u64;
+            if self.remaining == 0 {
+                out.0.push_back(CRLF);
+            }
+        }
+        out
+    }
+}
+
+impl Buf for Segments {
+    fn remaining(&self) -> usize {
+        self.0.iter().map(Bytes::len).sum()
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.0.front().map_or(&[], |b| b.as_ref())
+    }
+
+    fn advance(&mut self, mut cnt: usize) {
+        while cnt > 0 {
+            let front = self
+                .0
+                .front_mut()
+                .expect("advance past the end of segments");
+            if cnt < front.len() {
+                front.advance(cnt);
+                return;
+            }
+            cnt -= front.len();
+            self.0.pop_front();
+        }
+    }
+
+    fn chunks_vectored<'t>(&'t self, dst: &mut [IoSlice<'t>]) -> usize {
+        let mut n = 0;
+        for (slot, b) in dst.iter_mut().zip(self.0.iter().filter(|b| !b.is_empty())) {
+            *slot = IoSlice::new(b);
+            n += 1;
+        }
+        n
+    }
+}
+
 fn is_valid_trailer_field(name: &HeaderName) -> bool {
     !matches!(
         *name,
@@ -248,6 +395,7 @@ where
             BufKind::Chunked(ref b) => b.remaining(),
             BufKind::ChunkedEnd(ref b) => b.remaining(),
             BufKind::Trailers(ref b) => b.remaining(),
+            BufKind::Segments(ref b) => b.remaining(),
         }
     }
 
@@ -259,6 +407,7 @@ where
             BufKind::Chunked(ref b) => b.chunk(),
             BufKind::ChunkedEnd(ref b) => b.chunk(),
             BufKind::Trailers(ref b) => b.chunk(),
+            BufKind::Segments(ref b) => b.chunk(),
         }
     }
 
@@ -270,6 +419,7 @@ where
             BufKind::Chunked(ref mut b) => b.advance(cnt),
             BufKind::ChunkedEnd(ref mut b) => b.advance(cnt),
             BufKind::Trailers(ref mut b) => b.advance(cnt),
+            BufKind::Segments(ref mut b) => b.advance(cnt),
         }
     }
 
@@ -281,6 +431,7 @@ where
             BufKind::Chunked(ref b) => b.chunks_vectored(dst),
             BufKind::ChunkedEnd(ref b) => b.chunks_vectored(dst),
             BufKind::Trailers(ref b) => b.chunks_vectored(dst),
+            BufKind::Segments(ref b) => b.chunks_vectored(dst),
         }
     }
 }

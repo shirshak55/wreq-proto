@@ -9,6 +9,8 @@ pub(crate) mod conn;
 pub(crate) mod dispatch;
 pub(crate) mod role;
 
+use std::pin::Pin;
+
 use bytes::BytesMut;
 use http::{HeaderMap, Method};
 use httparse::ParserConfig;
@@ -19,6 +21,7 @@ use crate::{
     body::DecodedLength,
     error::{Error, Parse, Result},
     ext::OnInformational,
+    rt::Sleep,
 };
 
 pub(crate) trait Http1Transaction {
@@ -57,6 +60,8 @@ pub(crate) struct ParseContext<'a> {
     h1_max_headers: Option<usize>,
     h09_responses: bool,
     on_informational: &'a mut Option<OnInformational>,
+    /// The wait for `100 Continue` before a request body is sent, which a 100 ends.
+    expect_continue: &'a mut Option<Pin<Box<dyn Sleep>>>,
 }
 
 /// Passed to Http1Transaction::encode

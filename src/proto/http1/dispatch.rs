@@ -378,6 +378,8 @@ where
                         continue;
                     }
 
+                    ready!(self.conn.poll_expect_continue(cx));
+
                     let item = ready!(body.as_mut().poll_frame(cx));
                     if let Some(item) = item {
                         let frame = item.map_err(|e| {
@@ -394,7 +396,7 @@ where
                                     trace!("discarding empty chunk");
                                     self.conn.end_body()?;
                                 } else {
-                                    self.conn.write_body_and_end(chunk);
+                                    self.conn.write_body_and_end(chunk)?;
                                 }
                             } else {
                                 if chunk.remaining() == 0 {
@@ -407,7 +409,7 @@ where
                             *clear_body = true;
                             self.conn.write_trailers(
                                 frame.into_trailers().unwrap_or_else(|_| unreachable!()),
-                            );
+                            )?;
                         } else {
                             trace!("discarding unknown frame");
                             continue;
