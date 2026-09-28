@@ -16,7 +16,7 @@ use futures_util::{
     future::{Either, FusedFuture},
     stream::{FusedStream, Stream},
 };
-use http::{HeaderName, Method, Request, Response, StatusCode};
+use http::{header::HOST, uri::Authority, HeaderName, Method, Request, Response, StatusCode, Uri};
 use http2::{
     client::{Builder, Connection, ResponseFuture, SendRequest},
     ext::HeaderOrder,
@@ -646,6 +646,26 @@ fn record_raw_headers<T>(res: &mut Response<T>) {
     res.extensions_mut().insert(RawHeaders(raw));
 }
 
+/// Moves a request's `Host` field into the authority of its URI, which HTTP/2 sends as
+/// `:authority` (RFC 9113 section 8.3.1), so a `Host` a caller sets (relaying an HTTP/1 request,
+/// or editing one) names the authority rather than going out as a field beside it. A value
+/// that isn't an authority stays a field.
+fn host_as_authority<T>(req: &mut Request<T>) {
+    let Some(authority) = req
+        .headers()
+        .get(HOST)
+        .and_then(|host| Authority::try_from(host.as_bytes()).ok())
+    else {
+        return;
+    };
+    let mut parts = req.uri().clone().into_parts();
+    parts.authority = Some(authority);
+    if let Ok(uri) = Uri::from_parts(parts) {
+        *req.uri_mut() = uri;
+        req.headers_mut().remove(HOST);
+    }
+}
+
 impl<B, E, T> Future for ClientTask<B, E, T>
 where
     B: Body + 'static + Unpin,
@@ -693,6 +713,7 @@ where
                         .remove::<ExpectContinue>()
                         .filter(|_| ExpectContinue::is_expected(req.headers()));
                     super::strip_connection_headers(req.headers_mut(), true);
+                    host_as_authority(&mut req);
                     if let Some(len) = body.size_hint().exact() {
                         if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
                             headers::set_content_length_if_missing(req.headers_mut(), len);
