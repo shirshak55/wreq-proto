@@ -35,7 +35,9 @@ use crate::{
     body::{self, Incoming},
     dispatch::{self, Callback, SendWhen, TrySendError},
     error::BoxError,
-    ext::{ExpectContinue, OnInformational, OnPreserveHeader, RawHeaders, RawTrailers},
+    ext::{
+        ExpectContinue, HostAsAuthority, OnInformational, OnPreserveHeader, RawHeaders, RawTrailers,
+    },
     proto::{headers, Dispatched},
     rt::{bounds::Http2ClientConnExec, Sleep, Time},
     upgrade::{self, Upgraded},
@@ -646,11 +648,14 @@ fn record_raw_headers<T>(res: &mut Response<T>) {
     res.extensions_mut().insert(RawHeaders(raw));
 }
 
-/// Moves a request's `Host` field into the authority of its URI, which HTTP/2 sends as
-/// `:authority` (RFC 9113 section 8.3.1), so a `Host` a caller sets (relaying an HTTP/1 request,
-/// or editing one) names the authority rather than going out as a field beside it. A value
+/// Puts a request's `Host` field into the authority of its URI, which HTTP/2 sends as
+/// `:authority` (RFC 9113 section 8.3.1), as its [`HostAsAuthority`] asks, so a `Host` a
+/// caller sets (relaying an HTTP/1 request, or editing one) names the authority. A value
 /// that isn't an authority stays a field.
 fn host_as_authority<T>(req: &mut Request<T>) {
+    let Some(HostAsAuthority { keep_field }) = req.extensions_mut().remove() else {
+        return;
+    };
     let Some(authority) = req
         .headers()
         .get(HOST)
@@ -662,7 +667,9 @@ fn host_as_authority<T>(req: &mut Request<T>) {
     parts.authority = Some(authority);
     if let Ok(uri) = Uri::from_parts(parts) {
         *req.uri_mut() = uri;
-        req.headers_mut().remove(HOST);
+        if !keep_field {
+            req.headers_mut().remove(HOST);
+        }
     }
 }
 
