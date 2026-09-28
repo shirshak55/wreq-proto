@@ -17,6 +17,7 @@ use http::{
     header::{HeaderName, CONNECTION, TE, TRANSFER_ENCODING, UPGRADE},
     HeaderMap, HeaderValue,
 };
+pub use http2::ext::HeadersFrameOptions;
 pub use http2::frame::{
     Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
     SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
@@ -580,6 +581,13 @@ pub struct Http2Options {
 
     /// The list of PRIORITY frames to be sent after connection establishment.
     pub priorities: Option<Priorities>,
+
+    /// Whether the PRIORITY frames go out ahead of the first request only.
+    pub priorities_once: bool,
+
+    /// The exact parameters of the initial SETTINGS frame, in place of the individual
+    /// settings and their order.
+    pub settings_frame: Option<Vec<(u16, u32)>>,
 }
 
 impl Http2OptionsBuilder {
@@ -890,6 +898,31 @@ impl Http2OptionsBuilder {
         self
     }
 
+    /// Sends the [`priorities`](Self::priorities) PRIORITY frames once, ahead of the
+    /// connection's first request, as browsers do, rather than ahead of every request.
+    #[inline]
+    pub fn priorities_once(mut self, enabled: bool) -> Self {
+        self.opts.priorities_once = enabled;
+        self
+    }
+
+    /// Sends exactly `params` as the initial SETTINGS frame: each `(identifier, value)`
+    /// in order, unknown identifiers and repeats included, as captured from a client.
+    ///
+    /// The connection then behaves as the frame says: the known parameters it carries
+    /// replace the header table size, push, max concurrent streams, initial window size,
+    /// max frame size, max header list size, extended CONNECT and RFC 7540 priorities
+    /// options, the ones it leaves out keep their protocol defaults, and
+    /// [`settings_order`](Self::settings_order) no longer applies.
+    #[inline]
+    pub fn settings_frame<I>(mut self, params: I) -> Self
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        self.opts.settings_frame = Some(params.into_iter().collect());
+        self
+    }
+
     /// Builds the `Http2Options` instance.
     #[inline]
     pub fn build(self) -> Http2Options {
@@ -939,6 +972,8 @@ impl Default for Http2Options {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
+            priorities_once: false,
+            settings_frame: None,
         }
     }
 }

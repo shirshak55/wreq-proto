@@ -293,6 +293,10 @@ where
         if let Some(priority) = self.opts.priorities {
             builder.priorities(priority);
         }
+        builder.priorities_once(self.opts.priorities_once);
+        if let Some(params) = self.opts.settings_frame {
+            builder.settings_frame(params);
+        }
 
         // Create the ping configuration for the connection.
         let ping_config = ping::Config::new(

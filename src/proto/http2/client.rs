@@ -35,9 +35,9 @@ use crate::{
     body::{self, Incoming},
     dispatch::{self, Callback, SendWhen, TrySendError},
     error::BoxError,
-    ext::{OnInformational, OnPreserveHeader, RawHeaders, RawTrailers},
+    ext::{ExpectContinue, OnInformational, OnPreserveHeader, RawHeaders, RawTrailers},
     proto::{headers, Dispatched},
-    rt::{bounds::Http2ClientConnExec, Time},
+    rt::{bounds::Http2ClientConnExec, Sleep, Time},
     upgrade::{self, Upgraded},
     Error, Result,
 };
@@ -317,9 +317,17 @@ where
     cb: Callback<Request<B>, Response<Incoming>>,
     on_informational: Option<OnInformational>,
     raw_trailers: Option<RawTrailers>,
+    expect_continue: Option<ExpectContinue>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
+
+/// Holds a request body back until the server answers `100 Continue` (`true`), a final
+/// response arrives first (`false`, or the sender dropped), or `timeout` passes.
+struct ContinueWait {
+    rx: oneshot::Receiver<bool>,
+    timeout: Pin<Box<dyn Sleep>>,
+}
 
 pub(crate) struct ClientTask<B, E, T>
 where
@@ -348,6 +356,7 @@ pin_project! {
         #[pin]
         ping: Option<Recorder>,
         cancel_rx: Option<oneshot::Receiver<()>>,
+        continue_wait: Option<ContinueWait>,
     }
 }
 
@@ -382,6 +391,23 @@ where
             Some(Poll::Pending) | None => {}
         }
 
+        if let Some(wait) = this.continue_wait.as_mut() {
+            match Pin::new(&mut wait.rx).poll(cx) {
+                Poll::Ready(Ok(true)) => *this.continue_wait = None,
+                Poll::Ready(Ok(false) | Err(_)) => {
+                    debug!("final response before 100 Continue; not sending the request body");
+                    this.conn_drop_ref.take().expect(EXPECT_TAKEN_ONCE_MSG);
+                    this.ping.take().expect(EXPECT_TAKEN_ONCE_MSG);
+                    return Poll::Ready(());
+                }
+                Poll::Pending => {
+                    ready!(wait.timeout.as_mut().poll(cx));
+                    debug!("no 100 Continue before the timeout; sending the request body");
+                    *this.continue_wait = None;
+                }
+            }
+        }
+
         match Pin::new(&mut this.pipe).poll(cx) {
             Poll::Ready(result) => {
                 if let Err(_e) = result {
@@ -412,13 +438,28 @@ where
         // reset the stream when the client cancels the request.
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
+        // With `Expect: 100-continue`, the response tells the held-back body whether to go.
+        let (continue_wait, continue_tx) = match f.expect_continue {
+            Some(expect) => {
+                let (tx, rx) = oneshot::channel();
+                let timeout = expect.timer.sleep(expect.timeout);
+                (Some(ContinueWait { rx, timeout }), Some(tx))
+            }
+            None => (None, None),
+        };
+
         let send_stream = if !f.is_connect {
             if !f.eos {
                 let mut pipe = PipeToSendStream::new(f.body, f.body_tx, f.raw_trailers);
 
                 // eagerly see if the body pipe is ready and
                 // can thus skip allocating in the executor
-                match Pin::new(&mut pipe).poll(cx) {
+                let eager = if continue_wait.is_none() {
+                    Pin::new(&mut pipe).poll(cx)
+                } else {
+                    Poll::Pending
+                };
+                match eager {
                     Poll::Ready(_) => (),
                     Poll::Pending => {
                         let conn_drop_ref = self.conn_drop_ref.clone();
@@ -432,6 +473,7 @@ where
                             conn_drop_ref: Some(conn_drop_ref),
                             ping: Some(ping),
                             cancel_rx: Some(cancel_rx),
+                            continue_wait,
                         };
                         // Clear send task
                         self.executor
@@ -453,6 +495,7 @@ where
                     send_stream: Some(send_stream),
                     cancel_tx: Some(cancel_tx),
                     on_informational: f.on_informational,
+                    continue_tx,
                 },
                 call_back: Some(f.cb),
             },
@@ -490,6 +533,7 @@ pin_project! {
         send_stream: Option<Option<SendStream<SendBuf<<B as Body>::Data>>>>,
         cancel_tx: Option<oneshot::Sender<()>>,
         on_informational: Option<OnInformational>,
+        continue_tx: Option<oneshot::Sender<bool>>,
     }
 }
 
@@ -513,17 +557,27 @@ where
         let mut this = self.project();
 
         // Interim (1xx) responses reach the request's callback, in order, before the
-        // final response is taken.
-        if let Some(callback) = this.on_informational.as_ref() {
+        // final response is taken; a 100 releases a body held back for it.
+        if this.on_informational.is_some() || this.continue_tx.is_some() {
             while let Poll::Ready(Some(Ok(mut res))) =
                 this.fut.as_mut().get_mut().poll_informational(cx)
             {
-                record_raw_headers(&mut res);
-                callback.call(res);
+                if res.status() == StatusCode::CONTINUE {
+                    if let Some(tx) = this.continue_tx.take() {
+                        let _ = tx.send(true);
+                    }
+                }
+                if let Some(callback) = this.on_informational.as_ref() {
+                    record_raw_headers(&mut res);
+                    callback.call(res);
+                }
             }
         }
 
         let result = ready!(this.fut.poll(cx));
+        if let Some(tx) = this.continue_tx.take() {
+            let _ = tx.send(false);
+        }
 
         let ping = this.ping.take().expect("Future polled twice");
         let send_stream = this.send_stream.take().expect("Future polled twice");
@@ -634,6 +688,10 @@ where
                     let (head, body) = req.into_parts();
                     let mut req = ::http::Request::from_parts(head, ());
                     let on_informational = req.extensions_mut().remove::<OnInformational>();
+                    let expect_continue = req
+                        .extensions_mut()
+                        .remove::<ExpectContinue>()
+                        .filter(|_| ExpectContinue::is_expected(req.headers()));
                     super::strip_connection_headers(req.headers_mut(), true);
                     if let Some(len) = body.size_hint().exact() {
                         if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
@@ -691,6 +749,7 @@ where
                         cb,
                         on_informational,
                         raw_trailers,
+                        expect_continue: expect_continue.filter(|_| !is_connect && !eos),
                     };
 
                     // Check poll_ready() again.
