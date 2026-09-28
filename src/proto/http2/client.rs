@@ -18,7 +18,7 @@ use futures_util::{
 };
 use http::{header::HOST, uri::Authority, HeaderName, Method, Request, Response, StatusCode, Uri};
 use http2::{
-    client::{Builder, Connection, ResponseFuture, SendRequest},
+    client::{Builder, Connection, Control, ResponseFuture, SendRequest},
     ext::HeaderOrder,
     SendStream,
 };
@@ -54,6 +54,17 @@ type ConnDropRef = mpsc::Sender<Infallible>;
 ///// A oneshot channel watches the `Connection` task, and when it completes,
 ///// the "dispatch" task will be notified and can shutdown sooner.
 type ConnEof = oneshot::Receiver<Infallible>;
+
+impl<B, E, T> ClientTask<B, E, T>
+where
+    B: Body,
+    E: Unpin,
+{
+    /// Sends frames of the caller's choosing on the connection while it lives.
+    pub(crate) fn control(&self) -> Control {
+        self.h2_tx.control()
+    }
+}
 
 pub(crate) async fn handshake<T, B, E>(
     io: T,

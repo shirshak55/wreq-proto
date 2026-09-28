@@ -17,9 +17,10 @@ use http::{
     header::{HeaderName, CONNECTION, TE, TRANSFER_ENCODING, UPGRADE},
     HeaderMap, HeaderValue,
 };
+pub use http2::client::Control;
 pub use http2::ext::{
-    FollowingFrame, FrameLog, HeadersFrame, HeadersFrameOptions, LoggedFrame, PseudoHeader,
-    StreamPriority, UnknownFrame,
+    FollowingFrame, FrameLog, HeadersFrame, HeadersFrameOptions, LoggedFrame, PrefaceFrame,
+    PseudoHeader, StreamPriority, UnknownFrame,
 };
 pub use http2::frame::{
     Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
@@ -585,15 +586,20 @@ pub struct Http2Options {
     /// The list of PRIORITY frames to be sent after connection establishment.
     pub priorities: Option<Priorities>,
 
-    /// Whether the PRIORITY frames go out ahead of the first request only.
-    pub priorities_once: bool,
-
     /// The exact parameters of the initial SETTINGS frame, in place of the individual
     /// settings and their order.
     pub settings_frame: Option<Vec<(u16, u32)>>,
 
-    /// Frames of types HTTP/2 doesn't define, sent once ahead of the first request.
-    pub unknown_frames: Option<Vec<UnknownFrame>>,
+    /// Frames sent once, in order, right ahead of the first request's HEADERS.
+    pub preface_frames: Option<Vec<PrefaceFrame>>,
+
+    /// The released capacity the connection's WINDOW_UPDATEs wait for, in place of half
+    /// the window.
+    pub connection_window_threshold: Option<u32>,
+
+    /// The released capacity the streams' WINDOW_UPDATEs wait for, in place of half the
+    /// window.
+    pub stream_window_threshold: Option<u32>,
 
     /// How many of the frames it sends a connection records, if it records them.
     pub record_frames: Option<usize>,
@@ -907,14 +913,6 @@ impl Http2OptionsBuilder {
         self
     }
 
-    /// Sends the [`priorities`](Self::priorities) PRIORITY frames once, ahead of the
-    /// connection's first request, as browsers do, rather than ahead of every request.
-    #[inline]
-    pub fn priorities_once(mut self, enabled: bool) -> Self {
-        self.opts.priorities_once = enabled;
-        self
-    }
-
     /// Sends exactly `params` as the initial SETTINGS frame: each `(identifier, value)`
     /// in order, unknown identifiers and repeats included, as captured from a client.
     ///
@@ -932,14 +930,29 @@ impl Http2OptionsBuilder {
         self
     }
 
-    /// Sends `frames`, of types HTTP/2 doesn't define (GREASE and the like), once, right
-    /// ahead of the connection's first request's HEADERS, after its PRIORITY frames.
+    /// Sends `frames` once, in order, after the SETTINGS frame and right ahead of the
+    /// connection's first request's HEADERS: connection WINDOW_UPDATEs, PRIORITY frames
+    /// and frames of types HTTP/2 doesn't define (see [`PrefaceFrame`]).
     #[inline]
-    pub fn unknown_frames<I>(mut self, frames: I) -> Self
+    pub fn preface_frames<I>(mut self, frames: I) -> Self
     where
-        I: IntoIterator<Item = UnknownFrame>,
+        I: IntoIterator<Item = PrefaceFrame>,
     {
-        self.opts.unknown_frames = Some(frames.into_iter().collect());
+        self.opts.preface_frames = Some(frames.into_iter().collect());
+        self
+    }
+
+    /// Sends a WINDOW_UPDATE once `connection`, for the connection, or `stream`, for a
+    /// stream, bytes of received data were released since the last, rather than once half
+    /// the window was; `None` keeps half the window.
+    #[inline]
+    pub fn window_update_thresholds(
+        mut self,
+        connection: Option<u32>,
+        stream: Option<u32>,
+    ) -> Self {
+        self.opts.connection_window_threshold = connection;
+        self.opts.stream_window_threshold = stream;
         self
     }
 
@@ -1001,9 +1014,10 @@ impl Default for Http2Options {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
-            priorities_once: false,
             settings_frame: None,
-            unknown_frames: None,
+            preface_frames: None,
+            connection_window_threshold: None,
+            stream_window_threshold: None,
             record_frames: None,
         }
     }

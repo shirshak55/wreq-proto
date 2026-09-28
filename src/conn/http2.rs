@@ -18,7 +18,7 @@ use crate::{
     error::{BoxError, Error},
     proto::{
         self,
-        http2::{ping, Http2Options},
+        http2::{ping, Control, Http2Options},
     },
     rt::{bounds::Http2ClientConnExec, Time, Timer},
     Result,
@@ -27,6 +27,7 @@ use crate::{
 /// The sender side of an established connection.
 pub struct SendRequest<B> {
     dispatch: dispatch::UnboundedSender<Request<B>, Response<Incoming>>,
+    control: Control,
 }
 
 impl<B> Clone for SendRequest<B> {
@@ -34,6 +35,7 @@ impl<B> Clone for SendRequest<B> {
     fn clone(&self) -> SendRequest<B> {
         SendRequest {
             dispatch: self.dispatch.clone(),
+            control: self.control.clone(),
         }
     }
 }
@@ -69,6 +71,13 @@ pub struct Builder<Ex> {
 // ===== impl SendRequest
 
 impl<B> SendRequest<B> {
+    /// Sends frames of the caller's choosing on the connection while it lives: SETTINGS,
+    /// PINGs, and its WINDOW_UPDATE policy.
+    #[inline]
+    pub fn control(&self) -> &Control {
+        &self.control
+    }
+
     /// Polls to determine whether this sender can be used yet for a request.
     ///
     /// If the associated connection is closed, this returns an Error.
@@ -293,13 +302,16 @@ where
         if let Some(priority) = self.opts.priorities {
             builder.priorities(priority);
         }
-        builder.priorities_once(self.opts.priorities_once);
         if let Some(params) = self.opts.settings_frame {
             builder.settings_frame(params);
         }
-        if let Some(frames) = self.opts.unknown_frames {
-            builder.unknown_frames(frames);
+        if let Some(frames) = self.opts.preface_frames {
+            builder.preface_frames(frames);
         }
+        builder.window_update_thresholds(
+            self.opts.connection_window_threshold,
+            self.opts.stream_window_threshold,
+        );
         if let Some(limit) = self.opts.record_frames {
             builder.record_frames(limit);
         }
@@ -320,6 +332,7 @@ where
         Ok((
             SendRequest {
                 dispatch: tx.unbound(),
+                control: h2.control(),
             },
             Connection {
                 inner: (PhantomData, h2),
