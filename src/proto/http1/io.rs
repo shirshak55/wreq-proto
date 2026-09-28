@@ -210,7 +210,18 @@ where
         }
     }
 
+    /// Reads more from the transport into the read buffer. A peer closing without its TLS
+    /// close_notify (the transport's `UnexpectedEof`) ends an idle connection or a message
+    /// head as any close does: only a body read to the close is cut short by it (see
+    /// [`MemRead::read_mem`]).
     pub(crate) fn poll_read_from_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        match ready!(self.poll_read_io(cx)) {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Poll::Ready(Ok(0)),
+            read => Poll::Ready(read),
+        }
+    }
+
+    fn poll_read_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         self.read_blocked = false;
         let next = self.read_buf_strategy.next();
         if self.read_buf_remaining_mut() < next {
@@ -323,7 +334,7 @@ where
             let n = std::cmp::min(len, self.read_buf.len());
             Poll::Ready(Ok(self.read_buf.split_to(n).freeze()))
         } else {
-            let n = ready!(self.poll_read_from_io(cx))?;
+            let n = ready!(self.poll_read_io(cx))?;
             Poll::Ready(Ok(self.read_buf.split_to(::std::cmp::min(len, n)).freeze()))
         }
     }
@@ -671,6 +682,25 @@ mod tests {
             buffered.read_buf,
             b"HTTP/1.1 200 OK\r\nServer: crate::core:\r\n"[..]
         );
+    }
+
+    #[tokio::test]
+    async fn unclean_close_cuts_body_reads_only() {
+        let unclean = || io::Error::new(io::ErrorKind::UnexpectedEof, "no close_notify");
+
+        let mock = Mock::new().read(b"part").read_error(unclean()).build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(mock);
+        let data = std::future::poll_fn(|cx| buffered.read_mem(cx, 16))
+            .await
+            .unwrap();
+        assert_eq!(data, "part");
+        let cut = std::future::poll_fn(|cx| buffered.read_mem(cx, 16)).await;
+        assert_eq!(cut.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+
+        let mock = Mock::new().read_error(unclean()).build();
+        let mut buffered = Buffered::<_, Cursor<Vec<u8>>>::new(mock);
+        let idle = std::future::poll_fn(|cx| buffered.poll_read_from_io(cx)).await;
+        assert_eq!(idle.unwrap(), 0);
     }
 
     #[test]
