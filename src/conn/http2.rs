@@ -72,7 +72,7 @@ pub struct Builder<Ex> {
 
 impl<B> SendRequest<B> {
     /// Sends frames of the caller's choosing on the connection while it lives: SETTINGS,
-    /// PINGs, and its WINDOW_UPDATE policy.
+    /// PINGs, and its WINDOW_UPDATE policy; also tells the peer's connection preface.
     #[inline]
     pub fn control(&self) -> &Control {
         &self.control
