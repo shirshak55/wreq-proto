@@ -19,8 +19,8 @@ use http::{
 };
 pub use http2::client::Control;
 pub use http2::ext::{
-    FollowingFrame, FrameLog, HeadersFrame, HeadersFrameOptions, LoggedFrame, PrefaceFrame,
-    PseudoHeader, ReceivedPreface, StreamPriority, UnknownFrame,
+    FollowingFrame, FrameLog, HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo,
+    PrefaceFrame, PseudoHeader, ReceivedPreface, StreamPriority, UnknownFrame,
 };
 pub use http2::frame::{
     Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,

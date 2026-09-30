@@ -36,7 +36,8 @@ use crate::{
     dispatch::{self, Callback, SendWhen, TrySendError},
     error::BoxError,
     ext::{
-        ExpectContinue, HostAsAuthority, OnInformational, OnPreserveHeader, RawHeaders, RawTrailers,
+        ExpectContinue, HostAsAuthority, NoImpliedContentLength, OnInformational, OnPreserveHeader,
+        RawHeaders, RawTrailers,
     },
     proto::{headers, Dispatched},
     rt::{bounds::Http2ClientConnExec, Sleep, Time},
@@ -732,7 +733,11 @@ where
                         .filter(|_| ExpectContinue::is_expected(req.headers()));
                     super::strip_connection_headers(req.headers_mut(), true);
                     host_as_authority(&mut req);
-                    if let Some(len) = body.size_hint().exact() {
+                    let imply_length = req
+                        .extensions_mut()
+                        .remove::<NoImpliedContentLength>()
+                        .is_none();
+                    if let Some(len) = body.size_hint().exact().filter(|_| imply_length) {
                         if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
                             headers::set_content_length_if_missing(req.headers_mut(), len);
                         }
