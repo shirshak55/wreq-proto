@@ -18,9 +18,12 @@ use futures_util::{
 };
 use http::{header::HOST, uri::Authority, HeaderName, Method, Request, Response, StatusCode, Uri};
 use http2::{
-    client::{Builder, Connection, Control, ResponseFuture, SendRequest},
+    client::{
+        Builder, Connection, Control, PushPromises, PushedResponseFuture, ResponseFuture,
+        SendRequest,
+    },
     ext::HeaderOrder,
-    SendStream,
+    RecvStream, SendStream,
 };
 use http_body::Body;
 use pin_project_lite::pin_project;
@@ -37,7 +40,7 @@ use crate::{
     error::BoxError,
     ext::{
         ExpectContinue, HostAsAuthority, NoImpliedContentLength, OnInformational, OnPreserveHeader,
-        RawHeaders, RawTrailers,
+        PushedResponse, RawHeaders, RawTrailers, ServerPush,
     },
     proto::{headers, Dispatched},
     rt::{bounds::Http2ClientConnExec, Sleep, Time},
@@ -296,6 +299,9 @@ pin_project! {
             #[pin]
             task: ConnTask<T, B>,
         },
+        Push {
+            forward: Pin<Box<dyn Future<Output = ()> + Send>>,
+        },
     }
 }
 
@@ -315,6 +321,7 @@ where
             H2ClientFutureProject::Pipe { pipe } => pipe.poll(cx),
             H2ClientFutureProject::Send { send_when } => send_when.poll(cx),
             H2ClientFutureProject::Task { task } => task.poll(cx),
+            H2ClientFutureProject::Push { forward } => forward.as_mut().poll(cx),
         }
     }
 }
@@ -332,6 +339,7 @@ where
     on_informational: Option<OnInformational>,
     raw_trailers: Option<RawTrailers>,
     expect_continue: Option<ExpectContinue>,
+    pushes: Option<(Pushes, oneshot::Sender<Pushes>)>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -510,6 +518,7 @@ where
                     cancel_tx: Some(cancel_tx),
                     on_informational: f.on_informational,
                     continue_tx,
+                    pushes: f.pushes,
                 },
                 call_back: Some(f.cb),
             },
@@ -548,6 +557,9 @@ pin_project! {
         cancel_tx: Option<oneshot::Sender<()>>,
         on_informational: Option<OnInformational>,
         continue_tx: Option<oneshot::Sender<bool>>,
+        // The pushes promised on the request, forwarded here until the response's head
+        // arrives, then handed to their own task.
+        pushes: Option<(Pushes, oneshot::Sender<Pushes>)>,
     }
 }
 
@@ -588,9 +600,18 @@ where
             }
         }
 
+        // Pushes promised ahead of the head go ahead of the response.
+        if let Some((pushes, _)) = this.pushes.as_mut() {
+            pushes.forward(cx);
+        }
         let result = ready!(this.fut.poll(cx));
         if let Some(tx) = this.continue_tx.take() {
             let _ = tx.send(false);
+        }
+        if let Some((mut pushes, handoff)) = this.pushes.take() {
+            if result.is_ok() && pushes.forward(cx) {
+                let _ = handoff.send(pushes);
+            }
         }
 
         let ping = this.ping.take().expect("Future polled twice");
@@ -630,14 +651,7 @@ where
 
                     Poll::Ready(Ok(res))
                 } else {
-                    // Trailers may follow the body; record their field order.
-                    let raw_trailers = RawTrailers::default();
-                    let mut res = res.map(|stream| {
-                        let ping = ping.for_stream(&stream);
-                        Incoming::h2(stream, content_length.into(), ping, raw_trailers.clone())
-                    });
-                    res.extensions_mut().insert(raw_trailers);
-                    Poll::Ready(Ok(res))
+                    Poll::Ready(Ok(incoming(res, content_length, ping)))
                 }
             }
             Err(err) => {
@@ -648,6 +662,76 @@ where
             }
         }
     }
+}
+
+/// `res`, a response head arrived with its stream, with the stream as its body.
+fn incoming(
+    res: Response<RecvStream>,
+    content_length: Option<u64>,
+    ping: Recorder,
+) -> Response<Incoming> {
+    // Trailers may follow the body; record their field order.
+    let raw_trailers = RawTrailers::default();
+    let mut res = res.map(|stream| {
+        let ping = ping.for_stream(&stream);
+        Incoming::h2(stream, content_length.into(), ping, raw_trailers.clone())
+    });
+    res.extensions_mut().insert(raw_trailers);
+    res
+}
+
+/// The pushes promised on a request's stream, each sent to a [`ServerPush`]'s receiver as
+/// its promise arrives.
+struct Pushes {
+    promises: PushPromises,
+    tx: tokio::sync::mpsc::UnboundedSender<(Request<()>, PushedResponse)>,
+    ping: Recorder,
+}
+
+impl Pushes {
+    /// Forwards the pushes promised so far, telling whether more can come.
+    fn forward(&mut self, cx: &mut Context<'_>) -> bool {
+        loop {
+            match self.promises.poll_push_promise(cx) {
+                Poll::Ready(Some(Ok(promise))) => {
+                    let (request, response) = promise.into_parts();
+                    let response = pushed_response(response, self.ping.clone());
+                    let _ = self.tx.send((request, response));
+                }
+                Poll::Ready(_) => return false,
+                Poll::Pending => return true,
+            }
+        }
+    }
+}
+
+/// Forwards the pushes `handoff` hands over until no more can come, or their receiver is
+/// dropped.
+async fn forward_pushes(handoff: oneshot::Receiver<Pushes>) {
+    let Ok(mut pushes) = handoff.await else {
+        return;
+    };
+    let tx = pushes.tx.clone();
+    let mut closed = std::pin::pin!(tx.closed());
+    std::future::poll_fn(|cx| {
+        if closed.as_mut().poll(cx).is_ready() || !pushes.forward(cx) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// A pushed response, read as a request's response is.
+fn pushed_response(response: PushedResponseFuture, ping: Recorder) -> PushedResponse {
+    PushedResponse(Box::pin(async move {
+        let mut res = response.await.map_err(Error::new_h2)?;
+        ping.record_non_data();
+        record_raw_headers(&mut res);
+        let content_length = headers::content_length_parse_all(res.headers());
+        Ok(incoming(res, content_length, ping))
+    }))
 }
 
 /// Records a response head's field order as [`RawHeaders`], as the HTTP/1 parser does,
@@ -727,6 +811,7 @@ where
                     let (head, body) = req.into_parts();
                     let mut req = ::http::Request::from_parts(head, ());
                     let on_informational = req.extensions_mut().remove::<OnInformational>();
+                    let server_push = req.extensions_mut().remove::<ServerPush>();
                     let expect_continue = req
                         .extensions_mut()
                         .remove::<ExpectContinue>()
@@ -772,7 +857,8 @@ where
 
                     // `send_request` clears the extensions.
                     let raw_trailers = req.extensions().get::<RawTrailers>().cloned();
-                    let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
+                    let (mut fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos)
+                    {
                         Ok(ok) => ok,
                         Err(err) => {
                             debug!("client send request error: {}", err);
@@ -784,6 +870,19 @@ where
                         }
                     };
 
+                    let pushes = server_push.map(|ServerPush(tx)| {
+                        let (handoff, handed) = oneshot::channel();
+                        self.executor.execute_h2_future(H2ClientFuture::Push {
+                            forward: Box::pin(forward_pushes(handed)),
+                        });
+                        let pushes = Pushes {
+                            promises: fut.push_promises(),
+                            tx,
+                            ping: self.ping.clone(),
+                        };
+                        (pushes, handoff)
+                    });
+
                     let f = FutCtx {
                         is_connect,
                         eos,
@@ -794,6 +893,7 @@ where
                         on_informational,
                         raw_trailers,
                         expect_continue: expect_continue.filter(|_| !is_connect && !eos),
+                        pushes,
                     };
 
                     // Check poll_ready() again.
