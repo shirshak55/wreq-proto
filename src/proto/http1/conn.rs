@@ -21,7 +21,10 @@ use super::{
 };
 use crate::{
     body::DecodedLength,
-    ext::{ExpectContinue, OnInformational, RawChunks, RawTrailers, RecordResponseChunks},
+    ext::{
+        ExpectContinue, OnInformational, RawChunks, RawTrailers, ReadClosed, RecordResponseChunks,
+        TrailerSpacing,
+    },
     proto::{headers, BodyLength, MessageHead},
     rt::Sleep,
     upgrade, Error, Result,
@@ -61,6 +64,8 @@ where
                 on_informational: None,
                 expect_continue: None,
                 record_response_chunks: false,
+                relay_half_close: None,
+                write_shut_down: false,
                 notify_read: false,
                 reading: Reading::Init,
                 writing: Writing::Init,
@@ -559,6 +564,7 @@ where
         }
 
         let raw_trailers = head.extensions.get::<RawTrailers>().cloned();
+        let trailer_spacing = head.extensions.get::<TrailerSpacing>().cloned();
         let raw_chunks = head.extensions.get::<RawChunks>().cloned();
         let buf = self.io.headers_buf();
 
@@ -583,11 +589,13 @@ where
                     .extensions
                     .remove::<ExpectContinue>()
                     .filter(|_| expects_continue && !encoder.is_eof())
-                    .map(|expect| expect.timer.sleep(expect.timeout));
+                    .map(|expect| expect.wait.map(|(timer, timeout)| timer.sleep(timeout)));
+                self.state.relay_half_close = head.extensions.remove::<ReadClosed>();
 
                 Some(
                     encoder
                         .with_raw_trailers(raw_trailers)
+                        .with_trailer_spacing(trailer_spacing)
                         .with_raw_chunks(raw_chunks),
                 )
             }
@@ -674,12 +682,35 @@ where
     /// Waits until a request body held back for `100 Continue` may be sent: the 100 came,
     /// or the wait timed out.
     pub(super) fn poll_expect_continue(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if let Some(wait) = &mut self.state.expect_continue {
+        if let Some(Some(wait)) = &mut self.state.expect_continue {
             ready!(wait.as_mut().poll(cx));
             debug!("no 100 Continue before the timeout; sending the request body");
             self.state.expect_continue = None;
         }
         Poll::Ready(())
+    }
+
+    /// The request body is going out, so a final response no longer cuts it off.
+    pub(super) fn sending_body(&mut self) {
+        self.state.expect_continue = None;
+    }
+
+    /// Ends the sending side once the request is written, when the client the request
+    /// relays ended its own.
+    pub(super) fn poll_relay_half_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(half_closed) = &self.state.relay_half_close else {
+            return Poll::Ready(Ok(()));
+        };
+        if !matches!(self.state.writing, Writing::KeepAlive | Writing::Closed) {
+            return Poll::Ready(Ok(()));
+        }
+        ready!(half_closed.poll_closed(cx));
+        ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+        ready!(self.poll_shutdown(cx))?;
+        trace!("relayed the client's half-close");
+        self.state.relay_half_close = None;
+        self.state.close_write();
+        Poll::Ready(Ok(()))
     }
 
     pub(super) fn write_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
@@ -794,9 +825,13 @@ where
     }
 
     pub(super) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state.write_shut_down {
+            return Poll::Ready(Ok(()));
+        }
         match ready!(Pin::new(self.io.io_mut()).poll_shutdown(cx)) {
             Ok(()) => {
                 trace!("shut down IO complete");
+                self.state.write_shut_down = true;
                 Poll::Ready(Ok(()))
             }
             Err(e) => {
@@ -883,10 +918,15 @@ struct State {
     /// the current request. MUST be unset after a non-1xx response is
     /// received.
     on_informational: Option<OnInformational>,
-    /// While set, the request body waits for `100 Continue` until this sleep ends.
-    expect_continue: Option<Pin<Box<dyn Sleep>>>,
+    /// Set until the request body starts, which waits for `100 Continue` until this sleep
+    /// ends.
+    expect_continue: Option<Option<Pin<Box<dyn Sleep>>>>,
     /// Record the chunk-size lines of the current request's chunked response.
     record_response_chunks: bool,
+    /// The half-close of the client the request being written relays.
+    relay_half_close: Option<ReadClosed>,
+    /// The sending side is shut down.
+    write_shut_down: bool,
     /// Set to true when the Dispatcher should poll read operations
     /// again. See the `maybe_notify` method for more.
     notify_read: bool,
@@ -1053,6 +1093,7 @@ impl State {
 
         self.method = None;
         self.keep_alive.idle();
+        self.relay_half_close = None;
 
         if !self.is_idle() {
             self.close();

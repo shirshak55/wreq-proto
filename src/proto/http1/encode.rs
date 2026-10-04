@@ -16,7 +16,7 @@ use super::{
     io::WriteBuf,
     role::{write_headers, write_raw_headers},
 };
-use crate::ext::{RawChunks, RawTrailers};
+use crate::ext::{RawChunks, RawTrailers, TrailerSpacing};
 
 type StaticBuf = &'static [u8];
 
@@ -26,6 +26,7 @@ pub(crate) struct Encoder {
     kind: Kind,
     is_last: bool,
     raw_trailers: Option<RawTrailers>,
+    trailer_spacing: Option<TrailerSpacing>,
     raw_chunks: Option<ChunkPlan>,
 }
 
@@ -78,6 +79,7 @@ impl Encoder {
             kind,
             is_last: false,
             raw_trailers: None,
+            trailer_spacing: None,
             raw_chunks: None,
         }
     }
@@ -85,6 +87,12 @@ impl Encoder {
     /// Writes the trailers with the spelling and order `raw` records, once it does.
     pub(crate) fn with_raw_trailers(mut self, raw: Option<RawTrailers>) -> Self {
         self.raw_trailers = raw;
+        self
+    }
+
+    /// Writes the trailers `raw_trailers` records with the spacing `spacing` records.
+    pub(crate) fn with_trailer_spacing(mut self, spacing: Option<TrailerSpacing>) -> Self {
+        self.trailer_spacing = spacing;
         self
     }
 
@@ -233,7 +241,15 @@ impl Encoder {
 
                 let mut buf = Vec::new();
                 match self.raw_trailers.as_ref().and_then(|raw| raw.0.get()) {
-                    Some(raw) => write_raw_headers(&allowed_trailers, raw, &mut buf),
+                    Some(raw) => write_raw_headers(
+                        &allowed_trailers,
+                        raw,
+                        self.trailer_spacing
+                            .as_ref()
+                            .and_then(|spacing| spacing.0.get())
+                            .filter(|spacing| spacing.len() == raw.len()),
+                        &mut buf,
+                    ),
                     None => write_headers(&allowed_trailers, &mut buf),
                 }
 

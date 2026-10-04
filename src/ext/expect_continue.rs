@@ -1,4 +1,9 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use crate::rt::Timer;
 
@@ -13,8 +18,7 @@ use crate::rt::Timer;
 /// or HTTP/1.0, the body follows the head at once.
 #[derive(Clone)]
 pub struct ExpectContinue {
-    pub(crate) timer: Arc<dyn Timer + Send + Sync>,
-    pub(crate) timeout: Duration,
+    pub(crate) wait: Option<(Arc<dyn Timer + Send + Sync>, Duration)>,
 }
 
 impl ExpectContinue {
@@ -25,9 +29,16 @@ impl ExpectContinue {
         T: Timer + Send + Sync + 'static,
     {
         Self {
-            timer: Arc::new(timer),
-            timeout,
+            wait: Some((Arc::new(timer), timeout)),
         }
+    }
+
+    /// Sends the body as soon as it yields data, for a body whose producer already waits
+    /// for `100 Continue` (a proxy relaying its client's body). Over HTTP/1, a final
+    /// response arriving before any of the body was written still closes the connection
+    /// after it.
+    pub fn relayed() -> Self {
+        Self { wait: None }
     }
 
     /// Whether `headers` carry `Expect: 100-continue`.
@@ -41,7 +52,33 @@ impl ExpectContinue {
 impl fmt::Debug for ExpectContinue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExpectContinue")
-            .field("timeout", &self.timeout)
+            .field("timeout", &self.wait.as_ref().map(|(_, timeout)| timeout))
             .finish()
+    }
+}
+
+/// Ends the sending side of the HTTP/1 connection a request carrying it goes over once
+/// the request is written and `poll` is ready: a proxy relaying a client that half-closed
+/// its connection (a TCP FIN) mid-request half-closes too.
+#[derive(Clone)]
+pub struct ReadClosed(Arc<dyn Fn(&mut Context<'_>) -> Poll<()> + Send + Sync>);
+
+impl ReadClosed {
+    /// Half-closes once `poll` is ready, which registers the waker it is given otherwise.
+    pub fn new<F>(poll: F) -> Self
+    where
+        F: Fn(&mut Context<'_>) -> Poll<()> + Send + Sync + 'static,
+    {
+        Self(Arc::new(poll))
+    }
+
+    pub(crate) fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<()> {
+        (self.0)(cx)
+    }
+}
+
+impl fmt::Debug for ReadClosed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadClosed").finish_non_exhaustive()
     }
 }

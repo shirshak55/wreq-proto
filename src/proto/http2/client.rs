@@ -461,10 +461,10 @@ where
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
         // With `Expect: 100-continue`, the response tells the held-back body whether to go.
-        let (continue_wait, continue_tx) = match f.expect_continue {
-            Some(expect) => {
+        let (continue_wait, continue_tx) = match f.expect_continue.and_then(|expect| expect.wait) {
+            Some((timer, timeout)) => {
                 let (tx, rx) = oneshot::channel();
-                let timeout = expect.timer.sleep(expect.timeout);
+                let timeout = timer.sleep(timeout);
                 (Some(ContinueWait { rx, timeout }), Some(tx))
             }
             None => (None, None),

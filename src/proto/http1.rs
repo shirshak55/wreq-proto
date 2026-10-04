@@ -61,7 +61,7 @@ pub(crate) struct ParseContext<'a> {
     h09_responses: bool,
     on_informational: &'a mut Option<OnInformational>,
     /// The wait for `100 Continue` before a request body is sent, which a 100 ends.
-    expect_continue: &'a mut Option<Pin<Box<dyn Sleep>>>,
+    expect_continue: &'a mut Option<Option<Pin<Box<dyn Sleep>>>>,
 }
 
 /// Passed to Http1Transaction::encode

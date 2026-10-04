@@ -684,16 +684,26 @@ pub(crate) fn write_headers(headers: &HeaderMap, dst: &mut Vec<u8>) {
 pub(crate) fn write_raw_headers(
     headers: &HeaderMap,
     raw: &[(Bytes, HeaderValue)],
+    spacing: Option<&Vec<(Bytes, Bytes)>>,
     dst: &mut Vec<u8>,
 ) {
-    let mut line = |name: &[u8], value: &HeaderValue| {
+    let mut line = |name: &[u8], value: &HeaderValue, spacing: Option<&(Bytes, Bytes)>| {
         extend(dst, name);
-        extend(dst, b": ");
-        extend(dst, value.as_bytes());
+        match spacing {
+            Some((separator, trailing)) => {
+                extend(dst, separator);
+                extend(dst, value.as_bytes());
+                extend(dst, trailing);
+            }
+            None => {
+                extend(dst, b": ");
+                extend(dst, value.as_bytes());
+            }
+        }
         extend(dst, b"\r\n");
     };
     let mut values = HashMap::new();
-    for (spelling, _) in raw {
+    for (at, (spelling, _)) in raw.iter().enumerate() {
         let Ok(name) = HeaderName::from_bytes(spelling) else {
             continue;
         };
@@ -701,7 +711,7 @@ pub(crate) fn write_raw_headers(
             .entry(name)
             .or_insert_with_key(|name| headers.get_all(name).iter());
         if let Some(value) = values.next() {
-            line(spelling, value);
+            line(spelling, value, spacing.map(|spacing| &spacing[at]));
         }
     }
     for name in headers.keys() {
@@ -709,7 +719,7 @@ pub(crate) fn write_raw_headers(
             .remove(name)
             .unwrap_or_else(|| headers.get_all(name).iter());
         for value in rest {
-            line(name.as_ref(), value);
+            line(name.as_ref(), value, None);
         }
     }
 }

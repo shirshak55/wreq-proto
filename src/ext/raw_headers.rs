@@ -26,3 +26,10 @@ impl RawHeaders {
 /// relays before the trailers arrive.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RawTrailers(pub Arc<OnceLock<Vec<(Bytes, HeaderValue)>>>);
+
+/// What each trailer field of a message had between its name and its value (the colon
+/// included), and after its value up to its line ending, in the order of its
+/// [`RawTrailers`]. A request sent over HTTP/1 carrying a filled one with its `RawTrailers`
+/// writes its trailers so. Clones share the record, like `RawTrailers`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrailerSpacing(pub Arc<OnceLock<Vec<(Bytes, Bytes)>>>);
