@@ -15,7 +15,7 @@ use super::{Encode, Encoder, Http1Transaction, ParseContext, ParsedMessage};
 use crate::{
     body::DecodedLength,
     error::Parse,
-    ext::{OnPreserveHeader, RawHeaders, ReasonPhrase},
+    ext::{FieldSpacing, OnPreserveHeader, RawHeaders, RawRequestTarget, ReasonPhrase},
     proto::{headers, BodyLength, MessageHead, RequestHead, RequestLine},
     Error, Result,
 };
@@ -283,8 +283,28 @@ impl Http1Transaction for Client {
 
         extend(dst, msg.head.subject.0.as_str().as_bytes());
         extend(dst, b" ");
-        //TODO: add API to http::Uri to encode without std::fmt
-        let _ = write!(FastWrite(dst), "{} ", msg.head.subject.1);
+        let uri = &msg.head.subject.1;
+        match msg
+            .head
+            .extensions
+            .get::<RawRequestTarget>()
+            .filter(|raw| uri.path_and_query() == Some(&raw.encoded))
+        {
+            Some(raw) => {
+                if let Some(scheme) = uri.scheme() {
+                    let _ = write!(FastWrite(dst), "{scheme}://");
+                }
+                if let Some(authority) = uri.authority() {
+                    extend(dst, authority.as_str().as_bytes());
+                }
+                extend(dst, &raw.raw);
+                extend(dst, b" ");
+            }
+            //TODO: add API to http::Uri to encode without std::fmt
+            None => {
+                let _ = write!(FastWrite(dst), "{uri} ");
+            }
+        }
 
         match msg.head.version {
             Version::HTTP_10 => extend(dst, b"HTTP/1.0"),
@@ -298,16 +318,31 @@ impl Http1Transaction for Client {
         extend(dst, b"\r\n");
 
         if let Some(header_sort) = &msg.head.extensions.get::<OnPreserveHeader>() {
+            let spacing = msg.head.extensions.get::<FieldSpacing>();
+            let mut lines = HeaderMap::<usize>::default();
             header_sort.call_visit(&mut msg.head.headers, &mut |name, value| {
                 extend(dst, name.as_ref());
 
-                // Wanted for curl test cases that send `X-Custom-Header:\r\n`
-                if value.is_empty() {
-                    extend(dst, b":\r\n");
-                } else {
-                    extend(dst, b": ");
-                    extend(dst, value.as_bytes());
-                    extend(dst, b"\r\n");
+                let spacing = spacing.and_then(|spacing| {
+                    let name = HeaderName::from_bytes(name.as_ref()).ok()?;
+                    let nth = lines.entry(&name).or_insert(0);
+                    *nth += 1;
+                    spacing.get(&name, *nth - 1)
+                });
+                match spacing {
+                    Some((separator, trailing)) => {
+                        extend(dst, separator);
+                        extend(dst, value.as_bytes());
+                        extend(dst, trailing);
+                        extend(dst, b"\r\n");
+                    }
+                    // Wanted for curl test cases that send `X-Custom-Header:\r\n`
+                    None if value.is_empty() => extend(dst, b":\r\n"),
+                    None => {
+                        extend(dst, b": ");
+                        extend(dst, value.as_bytes());
+                        extend(dst, b"\r\n");
+                    }
                 }
             });
         } else {

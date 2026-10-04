@@ -8,6 +8,7 @@ mod no_implied_content_length;
 mod preserve_header;
 mod raw_chunks;
 mod raw_headers;
+mod raw_request;
 mod server_push;
 
 pub use self::{
@@ -19,6 +20,7 @@ pub use self::{
     preserve_header::{on_preserve_header, OnPreserveHeaderCallback},
     raw_chunks::{record_response_chunks, RawChunks},
     raw_headers::{RawHeaders, RawTrailers},
+    raw_request::{FieldSpacing, RawRequestTarget},
     server_push::{PushedResponse, ServerPush},
 };
 pub(crate) use self::{
