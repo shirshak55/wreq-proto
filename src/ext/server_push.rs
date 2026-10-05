@@ -13,9 +13,10 @@ use crate::{body::Incoming, Result};
 /// each promised request's head and its [`PushedResponse`] are sent as the promise arrives,
 /// until no more can come on the request's stream (its response ended, or it was reset) or
 /// the receiver is dropped. Without it, a promised push is cancelled once the response is
-/// dropped. Ignored over HTTP/1.
+/// dropped. Ignored over HTTP/1. Each push goes boxed, so that a channel that never carries
+/// one stays small.
 #[derive(Clone, Debug)]
-pub struct ServerPush(pub UnboundedSender<(http::Request<()>, PushedResponse)>);
+pub struct ServerPush(pub UnboundedSender<Box<(http::Request<()>, PushedResponse)>>);
 
 /// The response an HTTP/2 server pushes for a promised request, as its head arrives. Dropped
 /// before its end, as is its body, it cancels the push.

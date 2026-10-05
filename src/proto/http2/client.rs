@@ -687,7 +687,7 @@ fn incoming(
 /// its promise arrives.
 struct Pushes {
     promises: PushPromises,
-    tx: tokio::sync::mpsc::UnboundedSender<(Request<()>, PushedResponse)>,
+    tx: tokio::sync::mpsc::UnboundedSender<Box<(Request<()>, PushedResponse)>>,
     ping: Recorder,
 }
 
@@ -699,7 +699,7 @@ impl Pushes {
                 Poll::Ready(Some(Ok(promise))) => {
                     let (request, response) = promise.into_parts();
                     let response = pushed_response(response, self.ping.clone());
-                    let _ = self.tx.send((request, response));
+                    let _ = self.tx.send(Box::new((request, response)));
                 }
                 Poll::Ready(_) => return false,
                 Poll::Pending => return true,
