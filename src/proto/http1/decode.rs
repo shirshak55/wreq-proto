@@ -22,6 +22,10 @@ const CHUNKED_EXTENSIONS_LIMIT: u64 = 1024 * 16;
 /// TODO: remove this when we land h1_max_header_size support
 const TRAILER_LIMIT: usize = 1024 * 16;
 
+/// How much data of chunks already read goes out together, as one frame, so a body sent
+/// in many small chunks isn't relayed a frame (and a write) per chunk.
+const CHUNKS_COALESCED: usize = 1024 * 16;
+
 /// Decoders to handle different Transfer-Encodings.
 ///
 /// If a message body does not include a Transfer-Encoding, it *should*
@@ -48,6 +52,8 @@ enum Kind {
         raw_chunks: Option<RawChunks>,
         /// The chunk-size line being read, for `raw_chunks`.
         raw_line: BytesMut,
+        /// An error met after data returned first, for the next decode to return.
+        deferred: Option<DeferredError>,
     },
     /// A Reader used for responses that don't indicate a length or chunked.
     ///
@@ -146,6 +152,7 @@ impl Decoder {
                 raw_trailers: None,
                 raw_chunks: None,
                 raw_line: BytesMut::new(),
+                deferred: None,
             },
         }
     }
@@ -229,10 +236,25 @@ impl Decoder {
                 ref raw_trailers,
                 ref raw_chunks,
                 ref mut raw_line,
+                ref mut deferred,
             } => {
+                if let Some(DeferredError(e)) = deferred.take() {
+                    return Poll::Ready(Err(e));
+                }
                 let h1_max_headers = h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
                 let h1_max_header_size = h1_max_header_size.unwrap_or(TRAILER_LIMIT);
+                let mut data = BytesMut::new();
                 loop {
+                    // The data goes out before a large chunk, read on its own, and before
+                    // the last chunk, so trailers follow it.
+                    if !data.is_empty()
+                        && (data.len() >= CHUNKS_COALESCED
+                            || *state == ChunkedState::EndCr
+                            || *state == ChunkedState::Body
+                                && *chunk_len >= CHUNKS_COALESCED as u64)
+                    {
+                        return Poll::Ready(Ok(Frame::data(data.freeze())));
+                    }
                     let mut buf = None;
                     let args = StepArgs {
                         chunk_size: chunk_len,
@@ -244,16 +266,23 @@ impl Decoder {
                         max_headers_bytes: h1_max_header_size,
                     };
                     let prev = *state;
-                    // advances the chunked state
-                    *state = if raw_chunks.is_some() && state.is_size_line() {
+                    let step = if raw_chunks.is_some() && state.is_size_line() {
                         let mut rdr = LineRecorder {
                             rdr: body,
                             line: raw_line,
                         };
-                        ready!(state.step(cx, &mut rdr, args))?
+                        state.step(cx, &mut rdr, args)
                     } else {
-                        ready!(state.step(cx, body, args))?
+                        state.step(cx, body, args)
                     };
+                    if !data.is_empty() && !matches!(step, Poll::Ready(Ok(_))) {
+                        if let Poll::Ready(Err(e)) = step {
+                            *deferred = Some(DeferredError(e));
+                        }
+                        return Poll::Ready(Ok(Frame::data(data.freeze())));
+                    }
+                    // advances the chunked state
+                    *state = ready!(step)?;
                     if prev == ChunkedState::SizeLf {
                         if let Some(raw) = raw_chunks {
                             // The line ends at its CR, which the recorder read too.
@@ -291,7 +320,10 @@ impl Decoder {
                         return Poll::Ready(Ok(Frame::data(Bytes::new())));
                     }
                     if let Some(buf) = buf {
-                        return Poll::Ready(Ok(Frame::data(buf)));
+                        if data.is_empty() && buf.len() >= CHUNKS_COALESCED {
+                            return Poll::Ready(Ok(Frame::data(buf)));
+                        }
+                        data.extend_from_slice(&buf);
                     }
                 }
             }
@@ -761,6 +793,22 @@ fn decode_trailers(
             "Partial header",
         )),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
+    }
+}
+
+/// An error the decoder met after data it returned first.
+#[derive(Debug)]
+struct DeferredError(io::Error);
+
+impl Clone for DeferredError {
+    fn clone(&self) -> Self {
+        DeferredError(io::Error::new(self.0.kind(), self.0.to_string()))
+    }
+}
+
+impl PartialEq for DeferredError {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.kind() == other.0.kind() && self.0.to_string() == other.0.to_string()
     }
 }
 
