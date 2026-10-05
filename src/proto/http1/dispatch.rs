@@ -27,6 +27,8 @@ pub(crate) struct Dispatcher<D, Bs: Body, I, T> {
     body_tx: SenderGuard,
     body_rx: Pin<Box<Option<Bs>>>,
     is_closing: bool,
+    // The user body's error, returned once what was written before it is flushed.
+    body_error: Option<Error>,
 }
 
 pub(crate) trait Dispatch {
@@ -80,6 +82,7 @@ where
             body_tx: SenderGuard(None),
             body_rx: Box::pin(None),
             is_closing: false,
+            body_error: None,
         }
     }
 
@@ -339,7 +342,10 @@ where
 
     fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         loop {
-            if self.is_closing {
+            if self.body_error.is_some() {
+                ready!(self.poll_flush(cx))?;
+                return Poll::Ready(Err(self.body_error.take().expect("a body error")));
+            } else if self.is_closing {
                 return Poll::Ready(Ok(()));
             } else if self.body_rx.is_none()
                 && self.conn.can_write_head()
@@ -387,10 +393,14 @@ where
                     let item = ready!(body.as_mut().poll_frame(cx));
                     self.conn.sending_body();
                     if let Some(item) = item {
-                        let frame = item.map_err(|e| {
-                            *clear_body = true;
-                            Error::new_user_body(e)
-                        })?;
+                        let frame = match item {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                *clear_body = true;
+                                self.body_error = Some(Error::new_user_body(e));
+                                continue;
+                            }
+                        };
 
                         if frame.is_data() {
                             let chunk = frame.into_data().unwrap_or_else(|_| unreachable!());

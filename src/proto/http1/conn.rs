@@ -201,10 +201,8 @@ where
         // Drop any OnInformational callbacks, we're done there!
         self.state.on_informational = None;
         if self.state.expect_continue.take().is_some() {
-            // None of the body went out: the request ends at its head, as a client's that
-            // keeps its connection after such a response does, so the connection stays usable.
             debug!("final response before 100 Continue; not sending the request body");
-            self.state.writing = Writing::KeepAlive;
+            self.state.close_write();
         }
 
         self.state.busy();
@@ -219,8 +217,10 @@ where
 
         let raw_trailers = (msg.decode == DecodedLength::CHUNKED).then(|| {
             let raw = RawTrailers::default();
+            let spacing = TrailerSpacing::default();
             msg.head.extensions.insert(raw.clone());
-            raw
+            msg.head.extensions.insert(spacing.clone());
+            (raw, spacing)
         });
         let raw_chunks = (self.state.record_response_chunks
             && msg.decode == DecodedLength::CHUNKED)

@@ -10,11 +10,11 @@ use http_body::Frame;
 
 use self::Kind::{Chunked, Eof, Length};
 use super::{io::MemRead, role::DEFAULT_MAX_HEADERS, DecodedLength};
-use crate::ext::{RawChunks, RawTrailers};
+use crate::ext::{RawChunks, RawTrailers, TrailerSpacing};
 
-/// Maximum amount of bytes allowed in chunked extensions.
+/// Maximum amount of bytes allowed in a chunk's extensions.
 ///
-/// This limit is currentlty applied for the entire body, not per chunk.
+/// This limit is applied per chunk-size line, not for the entire body.
 const CHUNKED_EXTENSIONS_LIMIT: u64 = 1024 * 16;
 
 /// Maximum number of bytes allowed for all trailer fields.
@@ -48,7 +48,7 @@ enum Kind {
         trailers_cnt: usize,
         h1_max_headers: Option<usize>,
         h1_max_header_size: Option<usize>,
-        raw_trailers: Option<RawTrailers>,
+        raw_trailers: Option<(RawTrailers, TrailerSpacing)>,
         raw_chunks: Option<RawChunks>,
         /// The chunk-size line being read, for `raw_chunks`.
         raw_line: BytesMut,
@@ -169,8 +169,9 @@ impl Decoder {
         }
     }
 
-    /// Records a chunked body's trailer fields as sent into `raw` when it reads them.
-    pub(super) fn with_raw_trailers(mut self, raw: Option<RawTrailers>) -> Self {
+    /// Records a chunked body's trailer fields as sent, and their spacing, into `raw` when
+    /// it reads them.
+    pub(super) fn with_raw_trailers(mut self, raw: Option<(RawTrailers, TrailerSpacing)>) -> Self {
         if let Chunked { raw_trailers, .. } = &mut self.kind {
             *raw_trailers = raw;
         }
@@ -538,7 +539,10 @@ impl ChunkedState {
         // them from themselves, we reject extensions containing plain LF as
         // well.
         match byte!(rdr, cx) {
-            b'\r' => Poll::Ready(Ok(ChunkedState::SizeLf)),
+            b'\r' => {
+                *extensions_cnt = 0;
+                Poll::Ready(Ok(ChunkedState::SizeLf))
+            }
             b'\n' => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid chunk extension contains newline",
@@ -744,10 +748,11 @@ impl ChunkedState {
 fn decode_trailers(
     buf: &mut BytesMut,
     count: usize,
-    raw: Option<&RawTrailers>,
+    raw: Option<&(RawTrailers, TrailerSpacing)>,
 ) -> Result<HeaderMap, io::Error> {
     let mut trailers = HeaderMap::new();
     let mut raw_fields = Vec::new();
+    let mut spacings = Vec::new();
     let mut headers = vec![httparse::EMPTY_HEADER; count];
     let res = httparse::parse_headers(buf, &mut headers);
     match res {
@@ -779,12 +784,14 @@ fn decode_trailers(
                         Bytes::copy_from_slice(header.name.as_bytes()),
                         value.clone(),
                     ));
+                    spacings.push(trailer_spacing(buf, header));
                 }
                 trailers.append(name, value);
             }
 
-            if let Some(raw) = raw {
+            if let Some((raw, spacing)) = raw {
                 raw.0.get_or_init(|| raw_fields);
+                spacing.0.get_or_init(|| spacings);
             }
             Ok(trailers)
         }
@@ -794,6 +801,23 @@ fn decode_trailers(
         )),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
     }
+}
+
+/// What `header`, parsed from `buf`, has between its name and its value, and after its
+/// value up to its line ending.
+fn trailer_spacing(buf: &[u8], header: &httparse::Header<'_>) -> (Bytes, Bytes) {
+    let base = buf.as_ptr() as usize;
+    let name_end = header.name.as_ptr() as usize - base + header.name.len();
+    let value_start = header.value.as_ptr() as usize - base;
+    let value_end = value_start + header.value.len();
+    let line_end = buf[value_end..]
+        .iter()
+        .position(|&byte| byte == b'\r' || byte == b'\n')
+        .map_or(buf.len(), |at| value_end + at);
+    (
+        Bytes::copy_from_slice(&buf[name_end..value_start]),
+        Bytes::copy_from_slice(&buf[value_end..line_end]),
+    )
 }
 
 /// An error the decoder met after data it returned first.
@@ -1054,8 +1078,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_chunked_extensions_over_limit() {
-        // construct a chunked body where each individual chunked extension
-        // is totally fine, but combined is over the limit.
+        // construct a chunked body where each chunk's extensions are fine,
+        // though combined over the limit, then a chunk whose own are over it.
         let per_chunk = super::CHUNKED_EXTENSIONS_LIMIT * 2 / 3;
         let mut scratch = vec![];
         for _ in 0..2 {
@@ -1063,6 +1087,9 @@ mod tests {
             scratch.extend(b"x".repeat(per_chunk as usize));
             scratch.extend(b"\r\nA\r\n");
         }
+        scratch.extend(b"1;");
+        scratch.extend(b"x".repeat(super::CHUNKED_EXTENSIONS_LIMIT as usize));
+        scratch.extend(b"\r\nA\r\n");
         scratch.extend(b"0\r\n\r\n");
         let mut mock_buf = Bytes::from(scratch);
 
@@ -1073,7 +1100,7 @@ mod tests {
             .expect("decode1")
             .into_data()
             .expect("unknown frame type");
-        assert_eq!(&buf1[..], b"A");
+        assert_eq!(&buf1[..], b"AA");
 
         let err = decoder
             .decode_fut(&mut mock_buf)
