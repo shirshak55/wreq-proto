@@ -123,6 +123,7 @@ where
         h2_tx,
         req_rx,
         fut_ctx: None,
+        awaiting_settings: None,
         marker: PhantomData,
     })
 }
@@ -363,6 +364,8 @@ where
     h2_tx: SendRequest<SendBuf<B::Data>>,
     req_rx: ClientRx<B>,
     fut_ctx: Option<FutCtx<B>>,
+    /// An extended CONNECT waiting for the peer's SETTINGS (see `poll`).
+    awaiting_settings: Option<(Request<B>, Callback<Request<B>, Response<Incoming>>)>,
     marker: PhantomData<T>,
 }
 
@@ -801,12 +804,31 @@ where
                 continue;
             }
 
-            match self.req_rx.poll_recv(cx) {
-                Poll::Ready(Some((req, cb))) => {
+            let next = match self.awaiting_settings.take() {
+                Some(next) => Poll::Ready(Some(next)),
+                None => self.req_rx.poll_recv(cx),
+            };
+            match next {
+                Poll::Ready(Some((req, mut cb))) => {
                     // Check that future hasn't been canceled already
                     if cb.is_canceled() {
                         trace!("request callback is canceled");
                         continue;
+                    }
+                    // An extended CONNECT waits for the peer's SETTINGS, which tell whether it
+                    // may go at all (RFC 8441 §3), as do the requests after it, unless its
+                    // caller gives up on it.
+                    let extensions = req.extensions();
+                    if (extensions.get::<::http2::ext::ExtendedConnect>().is_some()
+                        || extensions.get::<::http2::ext::Protocol>().is_some())
+                        && self.h2_tx.poll_extended_connect(cx).is_pending()
+                    {
+                        if cb.poll_canceled(cx).is_ready() {
+                            trace!("request callback is canceled");
+                            continue;
+                        }
+                        self.awaiting_settings = Some((req, cb));
+                        return Poll::Pending;
                     }
                     let (head, body) = req.into_parts();
                     let mut req = ::http::Request::from_parts(head, ());
