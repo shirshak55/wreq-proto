@@ -30,12 +30,11 @@ pub(crate) struct Encoder {
     raw_chunks: Option<ChunkPlan>,
 }
 
-/// Where a chunked body being written stands in the [`RawChunks`] it follows.
+/// Where a chunked body being written stands in the [`RawChunks`] it follows, whose
+/// first line is the next to write: each line written is dropped from it.
 #[derive(Debug, Clone, PartialEq)]
 struct ChunkPlan {
     record: RawChunks,
-    /// The index of the next recorded line to write.
-    next: usize,
     /// The bytes still owed to the chunk being written.
     remaining: u64,
 }
@@ -102,7 +101,6 @@ impl Encoder {
             .filter(|_| self.kind == Kind::Chunked)
             .map(|record| ChunkPlan {
                 record,
-                next: 0,
                 remaining: 0,
             });
         self
@@ -128,7 +126,7 @@ impl Encoder {
             .and_then(|plan| {
                 plan.record
                     .lock()
-                    .get(plan.next)
+                    .first()
                     .filter(|(size, _)| *size == 0)
                     .map(|(_, line)| {
                         let mut last = Vec::with_capacity(line.len() + 2);
@@ -314,16 +312,17 @@ impl ChunkPlan {
     /// it; bytes past the record go out as one chunk.
     fn encode<B: Buf>(&mut self, mut msg: B) -> Segments {
         const CRLF: Bytes = Bytes::from_static(b"\r\n");
-        let lines = self.record.lock();
+        let mut lines = self.record.lock();
+        let mut written = 0;
         let mut out = Segments::default();
         while msg.has_remaining() {
             if self.remaining == 0 {
-                match lines.get(self.next) {
+                match lines.get(written) {
                     Some((size, line)) if *size > 0 => {
                         out.0.push_back(line.clone());
                         out.0.push_back(CRLF);
                         self.remaining = *size;
-                        self.next += 1;
+                        written += 1;
                     }
                     _ => {
                         let len = msg.remaining();
@@ -343,6 +342,7 @@ impl ChunkPlan {
                 out.0.push_back(CRLF);
             }
         }
+        lines.drain(..written);
         out
     }
 }

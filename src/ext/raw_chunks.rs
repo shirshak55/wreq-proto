@@ -11,9 +11,12 @@ use bytes::Bytes;
 /// sent carrying one splits its body at the recorded sizes and writes each recorded line,
 /// whatever frames the body yields, so a proxy relaying a received body keeps its chunks
 /// and their extensions; bytes past the record go out one chunk per frame, and a body
-/// ending inside a recorded chunk is an error. Clones share the lines, so a proxy can
-/// hand a received message's record (or its cell, from another HTTP library) to the
-/// request it relays as the lines arrive.
+/// ending inside a recorded chunk is an error. It drops each line from the record once
+/// written, so a long body's record holds only the lines still to go out (the last
+/// chunk's stays). Clones share the lines, so a proxy can hand a received message's
+/// record (or its cell, from another HTTP library) to the request it relays as the lines
+/// arrive; one also reading them takes them from the received record as they arrive,
+/// handing them on to a record of its own that the relayed request carries.
 #[derive(Clone, Debug, Default)]
 pub struct RawChunks(pub Arc<Mutex<Vec<(u64, Bytes)>>>);
 
