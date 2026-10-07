@@ -595,7 +595,12 @@ where
 
             None
         } else {
-            Some(f.body_tx)
+            // Its HEADERS still to send until they went, its tunnel then free to go on.
+            let mut body_tx = f.body_tx;
+            if let Some(sending) = f.sending {
+                body_tx.on_sent(move || drop(sending));
+            }
+            Some(body_tx)
         };
 
         self.executor.execute_h2_future(H2ClientFuture::Send {
@@ -968,7 +973,6 @@ where
                     let sending = self
                         .bodies_sent
                         .as_ref()
-                        .filter(|_| !is_connect)
                         .map(|sent| Sending::new(&sent.sending));
                     let (mut fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos)
                     {
