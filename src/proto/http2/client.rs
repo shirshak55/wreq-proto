@@ -391,6 +391,9 @@ where
     raw_trailers: Option<RawTrailers>,
     expect_continue: Option<ExpectContinue>,
     pushes: Option<(Pushes, oneshot::Sender<Pushes>)>,
+    // Counts the request as still to send from before its HEADERS were queued (see
+    // `SendingBodies`).
+    sending: Option<Sending>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -541,7 +544,13 @@ where
         };
 
         let send_stream = if !f.is_connect {
-            if !f.eos {
+            if f.eos {
+                // Its HEADERS still to send until they went.
+                if let Some(sending) = f.sending {
+                    let mut body_tx = f.body_tx;
+                    body_tx.on_sent(move || drop(sending));
+                }
+            } else {
                 let mut pipe = PipeToSendStream::new(f.body, f.body_tx, f.raw_trailers);
 
                 // eagerly see if the body pipe is ready and
@@ -554,8 +563,7 @@ where
                 match eager {
                     // Still to send until what it queued went (see `SendingBodies`).
                     Poll::Ready(_) => {
-                        if let Some(sent) = &self.bodies_sent {
-                            let sending = Sending::new(&sent.sending);
+                        if let Some(sending) = f.sending {
                             Pin::new(&mut pipe).on_sent(move || drop(sending));
                         }
                     }
@@ -572,10 +580,7 @@ where
                             ping: Some(ping),
                             cancel_rx: Some(cancel_rx),
                             continue_wait,
-                            sending: self
-                                .bodies_sent
-                                .as_ref()
-                                .map(|sent| Sending::new(&sent.sending)),
+                            sending: f.sending,
                             finishes: self
                                 .bodies_sent
                                 .as_ref()
@@ -960,6 +965,11 @@ where
 
                     // `send_request` clears the extensions.
                     let raw_trailers = req.extensions().get::<RawTrailers>().cloned();
+                    let sending = self
+                        .bodies_sent
+                        .as_ref()
+                        .filter(|_| !is_connect)
+                        .map(|sent| Sending::new(&sent.sending));
                     let (mut fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos)
                     {
                         Ok(ok) => ok,
@@ -997,6 +1007,7 @@ where
                         raw_trailers,
                         expect_continue: expect_continue.filter(|_| !is_connect && !eos),
                         pushes,
+                        sending,
                     };
 
                     // Check poll_ready() again.
