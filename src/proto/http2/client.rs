@@ -64,8 +64,8 @@ type ConnDropRef = mpsc::Sender<Infallible>;
 ///// the "dispatch" task will be notified and can shutdown sooner.
 type ConnEof = oneshot::Receiver<Infallible>;
 
-/// The request bodies a connection still has to send (see
-/// `conn::http2::Builder::sending_bodies`).
+/// The request bodies a connection still has to send, or the data of which it still
+/// holds queued (see `conn::http2::Builder::sending_bodies`).
 #[derive(Debug, Default)]
 pub struct SendingBodies {
     count: AtomicUsize,
@@ -433,7 +433,8 @@ pin_project! {
         ping: Option<Recorder>,
         cancel_rx: Option<oneshot::Receiver<()>>,
         continue_wait: Option<ContinueWait>,
-        // Counts its body as still to send until it is done (see `SendingBodies`).
+        // Counts its body as still to send until it is done, then hands that to its stream
+        // (see `SendingBodies`).
         sending: Option<Sending>,
         // Whether its body still goes once canceled (see `BodiesSent`).
         finishes: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -501,6 +502,9 @@ where
                 if let Err(_e) = result {
                     debug!("client request body error: {}", _e);
                 }
+                if let Some(sending) = this.sending.take() {
+                    this.pipe.as_mut().on_sent(move || drop(sending));
+                }
                 drop(this.conn_drop_ref.take().expect(EXPECT_TAKEN_ONCE_MSG));
                 drop(this.ping.take().expect(EXPECT_TAKEN_ONCE_MSG));
                 return Poll::Ready(());
@@ -548,7 +552,13 @@ where
                     Poll::Pending
                 };
                 match eager {
-                    Poll::Ready(_) => (),
+                    // Still to send until what it queued went (see `SendingBodies`).
+                    Poll::Ready(_) => {
+                        if let Some(sent) = &self.bodies_sent {
+                            let sending = Sending::new(&sent.sending);
+                            Pin::new(&mut pipe).on_sent(move || drop(sending));
+                        }
+                    }
                     Poll::Pending => {
                         let conn_drop_ref = self.conn_drop_ref.clone();
                         // keep the ping recorder's knowledge of an

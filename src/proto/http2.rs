@@ -153,6 +153,12 @@ where
     fn send_reset(self: Pin<&mut Self>, reason: http2::Reason) {
         self.project().body_tx.send_reset(reason);
     }
+
+    /// Calls `sent` once nothing its stream queued is still to go (see
+    /// `SendStream::on_sent`).
+    fn on_sent(self: Pin<&mut Self>, sent: impl FnOnce() + Send + 'static) {
+        self.project().body_tx.on_sent(sent);
+    }
 }
 
 impl<S> Future for PipeToSendStream<S>
