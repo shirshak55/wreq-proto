@@ -29,6 +29,9 @@ pub(crate) struct Dispatcher<D, Bs: Body, I, T> {
     is_closing: bool,
     // The user body's error, returned once what was written before it is flushed.
     body_error: Option<Error>,
+    // Canceled while its body was still going out, it sends what its body has ready, then
+    // closes.
+    finishing: bool,
 }
 
 pub(crate) trait Dispatch {
@@ -83,6 +86,7 @@ where
             body_rx: Box::pin(None),
             is_closing: false,
             body_error: None,
+            finishing: false,
         }
     }
 
@@ -141,6 +145,8 @@ where
                 self.conn.take_error()?;
                 return Poll::Ready(Ok(Dispatched::Upgrade(pending)));
             } else if should_shutdown {
+                // What it wrote goes out first, a request it closes mid-body included.
+                ready!(self.poll_flush(cx))?;
                 ready!(self.conn.poll_shutdown(cx)).map_err(Error::new_shutdown)?;
             }
             self.conn.take_error()?;
@@ -288,6 +294,14 @@ where
         // can dispatch receive, or does it still care about other incoming message?
         match ready!(self.dispatch.poll_ready(cx)) {
             Ok(()) => (),
+            // Canceled while its body is still going out, it reads nothing more, and sends what
+            // its body has ready: a proxy's client ending mid-request sent it before it ended.
+            Err(()) if self.body_rx.is_some() && !self.dispatch.should_poll() => {
+                trace!("request canceled mid-body, sending what its body has ready");
+                self.finishing = true;
+                self.conn.close_read();
+                return Poll::Ready(Ok(()));
+            }
             Err(()) => {
                 trace!("dispatch no longer receiving messages");
                 self.close();
@@ -388,9 +402,21 @@ where
                         continue;
                     }
 
-                    ready!(self.conn.poll_expect_continue(cx));
-
-                    let item = ready!(body.as_mut().poll_frame(cx));
+                    let item = match self.conn.poll_expect_continue(cx) {
+                        Poll::Ready(()) => body.as_mut().poll_frame(cx),
+                        Poll::Pending => Poll::Pending,
+                    };
+                    let item = match item {
+                        Poll::Ready(item) => item,
+                        // Finishing, it sends no more than its body has ready.
+                        Poll::Pending if self.finishing => {
+                            *clear_body = true;
+                            self.is_closing = true;
+                            self.conn.close_write();
+                            continue;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    };
                     self.conn.sending_body();
                     if let Some(item) = item {
                         let frame = match item {
@@ -469,6 +495,9 @@ where
     fn is_done(&self) -> bool {
         if self.is_closing {
             return true;
+        }
+        if self.finishing && self.body_rx.is_some() {
+            return false;
         }
 
         let read_done = self.conn.is_read_closed();
