@@ -3,6 +3,10 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{ready, Context, Poll},
 };
 
@@ -15,6 +19,7 @@ use futures_channel::{
 use futures_util::{
     future::{Either, FusedFuture},
     stream::{FusedStream, Stream},
+    task::AtomicWaker,
 };
 use http::{header::HOST, uri::Authority, HeaderName, Method, Request, Response, StatusCode, Uri};
 use http2::{
@@ -59,6 +64,49 @@ type ConnDropRef = mpsc::Sender<Infallible>;
 ///// the "dispatch" task will be notified and can shutdown sooner.
 type ConnEof = oneshot::Receiver<Infallible>;
 
+/// The request bodies a connection still has to send (see
+/// `conn::http2::Builder::sending_bodies`).
+#[derive(Debug, Default)]
+pub struct SendingBodies {
+    count: AtomicUsize,
+    none: AtomicWaker,
+}
+
+impl SendingBodies {
+    /// Whether the connection still has some to send, `cx` woken once it has none.
+    pub fn poll_any(&self, cx: &mut Context<'_>) -> bool {
+        self.none.register(cx.waker());
+        self.count.load(Ordering::Acquire) > 0
+    }
+}
+
+/// What a connection's caller shares with it (see `conn::http2::Builder::sending_bodies`):
+/// its request bodies still to send, and whether a request canceled now sends the rest of
+/// its body rather than resetting its stream.
+#[derive(Clone)]
+pub(crate) struct BodiesSent {
+    pub(crate) sending: Arc<SendingBodies>,
+    pub(crate) finishes: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// A request body still to send, counted in its connection's [`SendingBodies`] until dropped.
+struct Sending(Arc<SendingBodies>);
+
+impl Sending {
+    fn new(sending: &Arc<SendingBodies>) -> Self {
+        sending.count.fetch_add(1, Ordering::AcqRel);
+        Sending(Arc::clone(sending))
+    }
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.none.wake();
+        }
+    }
+}
+
 impl<B, E, T> ClientTask<B, E, T>
 where
     B: Body,
@@ -77,6 +125,7 @@ pub(crate) async fn handshake<T, B, E>(
     ping_config: ping::Config,
     mut exec: E,
     timer: Time,
+    bodies_sent: Option<BodiesSent>,
 ) -> Result<ClientTask<B, E, T>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -124,6 +173,7 @@ where
         req_rx,
         fut_ctx: None,
         awaiting_settings: None,
+        bodies_sent,
         marker: PhantomData,
     })
 }
@@ -366,6 +416,7 @@ where
     fut_ctx: Option<FutCtx<B>>,
     /// An extended CONNECT waiting for the peer's SETTINGS (see `poll`).
     awaiting_settings: Option<(Request<B>, Callback<Request<B>, Response<Incoming>>)>,
+    bodies_sent: Option<BodiesSent>,
     marker: PhantomData<T>,
 }
 
@@ -382,6 +433,10 @@ pin_project! {
         ping: Option<Recorder>,
         cancel_rx: Option<oneshot::Receiver<()>>,
         continue_wait: Option<ContinueWait>,
+        // Counts its body as still to send until it is done (see `SendingBodies`).
+        sending: Option<Sending>,
+        // Whether its body still goes once canceled (see `BodiesSent`).
+        finishes: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     }
 }
 
@@ -401,6 +456,14 @@ where
         // response future due to a timeout). If so, reset the h2 stream
         // so that a RST_STREAM is sent and flow-control capacity is freed.
         match this.cancel_rx.as_mut().map(|rx| Pin::new(rx).poll(cx)) {
+            // Once its client's connection ended, its body still sends what that client sent,
+            // its stream then ending with its connection, as that client's did.
+            Some(Poll::Ready(Ok(())))
+                if this.finishes.as_ref().is_some_and(|finishes| finishes()) =>
+            {
+                debug!("client request body send cancelled, finishing the body");
+                *this.cancel_rx = None;
+            }
             Some(Poll::Ready(Ok(()))) => {
                 debug!("client request body send cancelled, resetting stream");
                 this.pipe.as_mut().send_reset(http2::Reason::CANCEL);
@@ -499,6 +562,14 @@ where
                             ping: Some(ping),
                             cancel_rx: Some(cancel_rx),
                             continue_wait,
+                            sending: self
+                                .bodies_sent
+                                .as_ref()
+                                .map(|sent| Sending::new(&sent.sending)),
+                            finishes: self
+                                .bodies_sent
+                                .as_ref()
+                                .map(|sent| Arc::clone(&sent.finishes)),
                         };
                         // Clear send task
                         self.executor

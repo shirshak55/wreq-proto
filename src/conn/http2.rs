@@ -12,6 +12,7 @@ use http::{Request, Response};
 use http_body::Body;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+pub use crate::proto::http2::client::SendingBodies;
 use crate::{
     body::Incoming,
     dispatch::{self, TrySendError},
@@ -66,6 +67,7 @@ pub struct Builder<Ex> {
     exec: Ex,
     timer: Time,
     opts: Http2Options,
+    bodies_sent: Option<proto::http2::client::BodiesSent>,
 }
 
 // ===== impl SendRequest
@@ -219,6 +221,7 @@ where
             exec,
             timer: Time::Empty,
             opts: Default::default(),
+            bodies_sent: None,
         }
     }
 
@@ -236,6 +239,21 @@ where
     #[inline]
     pub fn options(mut self, opts: Http2Options) -> Self {
         self.opts = opts;
+        self
+    }
+
+    /// Has the connection count in `sending` its request bodies still to send, so that its
+    /// transport can tell it holds more to write though it wrote nothing lately (their bodies
+    /// paced, say); and, while `finishes` tells it to, as their client's connection ended,
+    /// send the rest of those canceled or failing with it rather than reset their streams,
+    /// which then end with the connection.
+    #[inline]
+    pub fn sending_bodies(
+        mut self,
+        sending: Arc<SendingBodies>,
+        finishes: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        self.bodies_sent = Some(proto::http2::client::BodiesSent { sending, finishes });
         self
     }
 
@@ -326,9 +344,16 @@ where
         );
 
         let (tx, rx) = dispatch::channel();
-        let h2 =
-            proto::http2::client::handshake(io, rx, builder, ping_config, self.exec, self.timer)
-                .await?;
+        let h2 = proto::http2::client::handshake(
+            io,
+            rx,
+            builder,
+            ping_config,
+            self.exec,
+            self.timer,
+            self.bodies_sent,
+        )
+        .await?;
         Ok((
             SendRequest {
                 dispatch: tx.unbound(),
