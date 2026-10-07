@@ -3,6 +3,7 @@
 use std::{
     future::Future,
     pin::Pin,
+    sync::{atomic::AtomicBool, Arc},
     task::{ready, Context, Poll},
 };
 
@@ -86,6 +87,7 @@ where
 #[derive(Debug, Default, Clone)]
 pub struct Builder {
     opts: Http1Options,
+    sending_body: Option<Arc<AtomicBool>>,
 }
 
 // ===== impl SendRequest
@@ -237,6 +239,15 @@ impl Builder {
         self
     }
 
+    /// Has the connection keep `sending` set while it has a request body still to send, so
+    /// that its transport can tell it holds more to write though it wrote nothing lately (its
+    /// body paced, say).
+    #[inline]
+    pub fn sending_body(mut self, sending: Arc<AtomicBool>) -> Self {
+        self.sending_body = Some(sending);
+        self
+    }
+
     /// Constructs a connection with the configured options and IO.
     ///
     /// Note, if [`Connection`] is not `await`-ed, [`SendRequest`] will
@@ -298,7 +309,10 @@ impl Builder {
         }
 
         let cd = http1::dispatch::Client::new(rx);
-        let proto = http1::dispatch::Dispatcher::new(cd, conn);
+        let mut proto = http1::dispatch::Dispatcher::new(cd, conn);
+        if let Some(sending) = self.sending_body {
+            proto.set_sending_body(sending);
+        }
 
         Ok((SendRequest { dispatch: tx }, Connection { inner: proto }))
     }

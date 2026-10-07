@@ -3,6 +3,10 @@ use std::{
     future::Future,
     marker::Unpin,
     pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{ready, Context, Poll},
 };
 
@@ -29,9 +33,10 @@ pub(crate) struct Dispatcher<D, Bs: Body, I, T> {
     is_closing: bool,
     // The user body's error, returned once what was written before it is flushed.
     body_error: Option<Error>,
-    // Canceled while its body was still going out, it sends what its body has ready, then
-    // closes.
+    // Canceled while its body was still going out, it sends the rest of its body, then closes.
     finishing: bool,
+    // Set while it has a request body still to send, for its transport to see.
+    sending_body: Option<Arc<AtomicBool>>,
 }
 
 pub(crate) trait Dispatch {
@@ -87,7 +92,13 @@ where
             is_closing: false,
             body_error: None,
             finishing: false,
+            sending_body: None,
         }
+    }
+
+    /// Keeps `sending` set while it has a request body still to send.
+    pub(crate) fn set_sending_body(&mut self, sending: Arc<AtomicBool>) {
+        self.sending_body = Some(sending);
     }
 
     #[inline]
@@ -294,10 +305,11 @@ where
         // can dispatch receive, or does it still care about other incoming message?
         match ready!(self.dispatch.poll_ready(cx)) {
             Ok(()) => (),
-            // Canceled while its body is still going out, it reads nothing more, and sends what
-            // its body has ready: a proxy's client ending mid-request sent it before it ended.
+            // Canceled while its body is still going out, it reads nothing more, and sends the
+            // rest of its body, until that ends or fails: a proxy's client ending mid-request sent
+            // it before it ended, and a body paced is still to come.
             Err(()) if self.body_rx.is_some() && !self.dispatch.should_poll() => {
-                trace!("request canceled mid-body, sending what its body has ready");
+                trace!("request canceled mid-body, sending the rest of its body");
                 self.finishing = true;
                 self.conn.close_read();
                 return Poll::Ready(Ok(()));
@@ -403,12 +415,8 @@ where
                     }
 
                     let item = match self.conn.poll_expect_continue(cx) {
-                        Poll::Ready(()) => body.as_mut().poll_frame(cx),
-                        Poll::Pending => Poll::Pending,
-                    };
-                    let item = match item {
-                        Poll::Ready(item) => item,
-                        // Finishing, it sends no more than its body has ready.
+                        Poll::Ready(()) => ready!(body.as_mut().poll_frame(cx)),
+                        // Finishing, a body still held back for its 100 Continue goes unsent.
                         Poll::Pending if self.finishing => {
                             *clear_body = true;
                             self.is_closing = true;
@@ -473,6 +481,9 @@ where
 
     #[inline]
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if let Some(sending) = &self.sending_body {
+            sending.store(self.body_rx.is_some(), Ordering::Release);
+        }
         self.conn.poll_flush(cx).map_err(|err| {
             debug!("error writing: {}", err);
             Error::new_body_write(err)
