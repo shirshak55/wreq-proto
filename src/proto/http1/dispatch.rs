@@ -20,6 +20,7 @@ use crate::{
     body::{self, DecodedLength, Incoming},
     dispatch::{self, TrySendError},
     error::BoxError,
+    ext::OnTaken,
     proto::{self, Dispatched, RequestHead},
     upgrade::OnUpgrade,
     Error, Result,
@@ -640,7 +641,10 @@ where
                         Poll::Ready(None)
                     }
                     Poll::Pending => {
-                        let (parts, body) = req.into_parts();
+                        let (mut parts, body) = req.into_parts();
+                        if let Some(taken) = parts.extensions.remove::<OnTaken>() {
+                            taken.taken();
+                        }
                         let head = RequestHead {
                             version: parts.version,
                             subject: proto::RequestLine(parts.method, parts.uri),

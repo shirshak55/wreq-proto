@@ -5,6 +5,7 @@ mod h1_reason_phrase;
 mod host_as_authority;
 mod informational;
 mod no_implied_content_length;
+mod on_taken;
 mod preserve_header;
 mod raw_chunks;
 mod raw_headers;
@@ -17,6 +18,7 @@ pub use self::{
     host_as_authority::HostAsAuthority,
     informational::on_informational,
     no_implied_content_length::NoImpliedContentLength,
+    on_taken::OnTaken,
     preserve_header::{on_preserve_header, OnPreserveHeaderCallback},
     raw_chunks::{record_response_chunks, RawChunks},
     raw_headers::{RawHeaders, RawTrailers, TrailerSpacing},
