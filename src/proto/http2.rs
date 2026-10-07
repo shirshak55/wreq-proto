@@ -293,7 +293,9 @@ impl<B: Buf> SendStreamExt for SendStream<SendBuf<B>> {
     {
         let err = Error::new_user_body(err);
         debug!("send body user stream error: {}", err);
-        self.send_reset(err.h2_reason());
+        // What the body gave before it failed goes out ahead of the reset: a proxy's client
+        // whose connection ended mid-request sent it before it ended.
+        self.send_reset_after_data(err.h2_reason());
         err
     }
 
